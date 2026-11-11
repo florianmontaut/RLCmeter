@@ -20,6 +20,12 @@ Remplace le classeur Excel `RLCmeter_extractorV4.xls` (code VBA d'origine dans `
    (type, plage de fréquence, ordre, capacité parallèle) relancent le fit à chaque
    changement ; la plage se règle aussi à la souris sur le graphe du haut.
 4. **Exporter** : modèle en `.subckt` pour LTspice, capture en `.csv`.
+5. **Utilitaires > Options** : répertoire de la librairie (ses sous-répertoires deviennent
+   des dossiers de l'arborescence) et réglages par défaut d'un nouveau modèle.
+6. **Utilitaires > Création de filtre** : filtre L, T ou Pi à partir de captures, de
+   modèles ou de composants idéaux ; gain d'insertion, coupure, atténuation.
+
+Le tutoriel complet est dans `docs/tutoriel.md` (menu Aide, F1).
 
 ## Organisation
 
@@ -30,9 +36,12 @@ Remplace le classeur Excel `RLCmeter_extractorV4.xls` (code VBA d'origine dans `
 | `model/fit.py` | modèles Foster / Cauer, fit, choix de l'ordre par AIC |
 | `model/library.py` | librairie de captures sur disque |
 | `model/spice.py` | export `.subckt` |
-| `controller/` | contrôleur principal, mesure en tâche de fond |
-| `view/main_window.py` | fenêtre (arbre, graphes, paramètres) |
+| `model/filter.py` | réponse d'un filtre en échelle (matrices chaîne) |
+| `controller/` | contrôleur principal, mesure en tâche de fond, création de filtre |
+| `view/` | fenêtre principale (arbre, graphes, paramètres), fenêtre de filtre |
 | `ressources/theme.py` | thème clair / sombre, repris de GLviewer |
+| `ressources/options_panel.py` | fenêtre d'options générée par schéma, reprise de GLviewer |
+| `ressources/app_settings.py` | schéma des options |
 
 ## Choix à connaître
 

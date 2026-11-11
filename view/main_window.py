@@ -39,6 +39,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowIcon(QtGui.QIcon(str(ICON)))
         self.resize(1400, 820)
         self._init_actions()
+        self._init_menus()
         self._init_toolbar()
         self._init_central()
         self._init_status_bar()
@@ -67,6 +68,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actionDelete = action("Supprimer", "trash",
                                    "Supprimer la capture ou le modèle sélectionné", "Del")
         self.actionDark = action("Thème sombre", "moon", "Thème sombre", checkable=True)
+        # barre de menus
+        self.actionOpen = action("Ouvrir...", "open", "Ouvrir une capture (.json)", "Ctrl+O")
+        self.actionSaveAs = action("Sauvegarder sous...", "save",
+                                   "Copier la capture sélectionnée dans un fichier", "Ctrl+S")
+        self.actionQuit = action("Quitter", "stop", "Quitter RLCmeter", "Ctrl+Q")
+        self.actionOptions = action("Options...", "settings", "Options de RLCmeter")
+        self.actionFilter = action("Création de filtre...", "filter",
+                                   "Combiner des composants en filtre et estimer sa réponse")
+        self.actionTutorial = action("Tutoriel", "file", "Tutoriel", "F1")
+        self.actionAbout = QtGui.QAction("À propos", self)
+
+    def _init_menus(self):
+        bar = self.menuBar()
+        self.menuFile = bar.addMenu("Fichier")
+        self.menuFile.addActions([self.actionOpen, self.actionSaveAs])
+        self.menuFile.addSeparator()
+        self.menuFile.addActions([self.actionExportSubckt, self.actionExportCsv])
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionQuit)
+        self.menuTools = bar.addMenu("Utilitaires")
+        self.menuTools.addActions([self.actionOptions, self.actionFilter])
+        self.menuHelp = bar.addMenu("Aide")
+        self.menuHelp.addActions([self.actionTutorial, self.actionAbout])
 
     def _init_toolbar(self):
         self.toolbar = QtWidgets.QToolBar("Barre d'outils", self)

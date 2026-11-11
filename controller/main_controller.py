@@ -20,12 +20,16 @@ from instrument import hp4194a
 from instrument.hp4194a import InstrumentError, SweepSettings, open_instrument
 from model import fit, spice
 from model.capture import DISPLAY_MODES, Capture, ModelFit
-from model.library import Library
-from ressources import theme
+from model.library import Library, LibraryError
+from ressources import app_settings, options_panel, theme
 from view.main_window import MainWindow
 
-# rôle de l'arbre : ("capture", id capture, None) ou ("model", id capture, id modèle)
+# rôle de l'arbre : ("capture", id capture, None), ("model", id capture, id modèle)
+# ou ("folder", chemin relatif dans la librairie, None)
 REF_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
+
+EXTERNAL = "Hors librairie"      # dossier des captures ouvertes hors de la librairie
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 COLORS = ("#0B6BCB", "#D9480F", "#2B8A3E", "#9C36B5", "#C2255C", "#0C8599", "#E67700",
           "#5C7CFA")
@@ -38,11 +42,17 @@ class MainController(QtCore.QObject):
     def __init__(self, view: MainWindow, library_folder, settings_path=None):
         super().__init__()
         self.view = view
-        self.library = Library(library_folder)
         self.settings_path = pathlib.Path(settings_path) if settings_path else None
+        # options (Utilitaires > Options) : valeurs par défaut du schéma, puis settings.json
+        self.schema = app_settings.schema(str(library_folder))
+        self.options = options_panel.schema_defaults(self.schema)
+        self.library = Library(library_folder)
+        self.filter_ctrl = None             # fenêtre « Création de filtre » (à la demande)
+        self._dialogs = []                  # fenêtres ouvertes (options, tutoriel)
         self._worker = None
         self._rebuilding = False            # arbre en reconstruction : itemChanged ignoré
         self._selection_param = None        # paramètres de l'élément sélectionné
+        self._folder_items = {}             # sous-répertoire -> élément de l'arbre
         self._model_group = None            # groupe « Réglages » du modèle affiché
         self._updating_model = False
 
@@ -59,6 +69,7 @@ class MainController(QtCore.QObject):
         self._load_settings()
         self._connect()
 
+        self.library = Library(self.options["library_dir"])
         self.library.load()
         self._rebuild_tree()
         self._apply_theme()
@@ -100,6 +111,13 @@ class MainController(QtCore.QObject):
         v.actionExportCsv.triggered.connect(self.export_csv)
         v.actionDelete.triggered.connect(self.delete_selected)
         v.actionDark.toggled.connect(self._apply_theme)
+        v.actionOpen.triggered.connect(self.open_files)
+        v.actionSaveAs.triggered.connect(self.save_capture_as)
+        v.actionQuit.triggered.connect(v.close)
+        v.actionOptions.triggered.connect(self.open_options)
+        v.actionFilter.triggered.connect(self.open_filter)
+        v.actionTutorial.triggered.connect(self.show_tutorial)
+        v.actionAbout.triggered.connect(self.show_about)
         v.displayCombo.currentTextChanged.connect(self._refresh_graph)
         v.tree.selectionModel().currentChanged.connect(self._on_selection_changed)
         self.tree_model.itemChanged.connect(self._on_item_changed)
@@ -119,6 +137,8 @@ class MainController(QtCore.QObject):
                     self.acq.child(name).setValue(value)
                 except Exception:
                     pass                        # valeur d'une ancienne version
+        self.options.update({k: v for k, v in data.get("options", {}).items()
+                             if k in self.options})
         if data.get("display") in DISPLAY_MODES:
             self.view.displayCombo.setCurrentText(data["display"])
         self.view.actionDark.setChecked(bool(data.get("dark", False)))
@@ -128,6 +148,7 @@ class MainController(QtCore.QObject):
             return
         data = {"acquisition": {p.name(): p.value() for p in self.acq.children()
                                 if not p.readonly()},
+                "options": self.options,
                 "display": self.view.displayCombo.currentText(),
                 "dark": self.view.actionDark.isChecked()}
         self.settings_path.write_text(json.dumps(data, indent=1, ensure_ascii=False),
@@ -140,6 +161,9 @@ class MainController(QtCore.QObject):
         brush.setAlpha(30)
         self.region.setBrush(brush)
         self._rebuild_tree(keep_selection=True)     # icônes de l'arbre à la bonne teinte
+        if self.filter_ctrl is not None:
+            self.filter_ctrl.view.apply_graph_theme()
+            self.filter_ctrl.compute()
 
     # ------------------------------------------------------------------ messages
     def _status(self, text: str, timeout: int = 8000):
@@ -153,6 +177,11 @@ class MainController(QtCore.QObject):
         return QtWidgets.QMessageBox.question(self.view, "RLCmeter", text,
                                               buttons.Yes | buttons.No,
                                               buttons.No) == buttons.Yes
+
+    def _ask_open_paths(self, title: str, file_filter: str) -> list[str]:
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self.view, title, str(self.library.folder), file_filter)
+        return paths
 
     def _ask_save_path(self, title: str, name: str, file_filter: str) -> str:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self.view, title, name, file_filter)
@@ -247,7 +276,7 @@ class MainController(QtCore.QObject):
         capture = Capture(name=self.library.unique_name(self.acq["Nom de la capture"]),
                           f=f, z=z, settings=settings.to_dict(), instrument=identity,
                           color=COLORS[len(self.library.captures) % len(COLORS)])
-        self.library.add(capture)
+        self.library.add(capture, self.target_folder())
         with self.acq.treeChangeBlocker():
             self.acq.child("Appareil").setValue(identity)
         self._rebuild_tree(select=("capture", capture.id, None))
@@ -260,26 +289,63 @@ class MainController(QtCore.QObject):
         self._rebuilding = True
         try:
             self.tree_model.clear()
-            target = None
+            self._folder_items = {}
+            target = [None]
+
+            def register(item):
+                if select is not None and tuple(select) == tuple(item.data(REF_ROLE)):
+                    target[0] = item
+
+            # sous-répertoires de la librairie, vides compris
+            for folder in self.library.subfolders():
+                self._folder_item(folder)
             for capture in self.library.captures:
+                folder = self.library.relative_folder(capture)
+                parent = self._folder_item(EXTERNAL if folder is None else folder)
                 item = self._make_item(capture.name, capture.visible, "signal_raw",
                                        capture.color, ("capture", capture.id, None))
-                self.tree_model.appendRow(item)
-                if select == item.data(REF_ROLE):
-                    target = item
+                parent.appendRow(item)
+                register(item)
                 for model in capture.models:
                     child = self._make_item(model.name, model.visible, "signal_modified",
                                             capture.color, ("model", capture.id, model.id))
                     item.appendRow(child)
-                    if select == child.data(REF_ROLE):
-                        target = child
+                    register(child)
+            for item in self._folder_items.values():
+                register(item)
         finally:
             self._rebuilding = False
         self.view.tree.expandAll()
-        if target is not None:
-            self.view.tree.setCurrentIndex(target.index())
+        if target[0] is not None:
+            self.view.tree.setCurrentIndex(target[0].index())
         else:
             self._on_selection_changed()
+        if self.filter_ctrl is not None:
+            self.filter_ctrl.refresh_sources()
+
+    def _folder_item(self, folder: str):
+        """Élément de l'arbre d'un sous-répertoire (« a/b »), créé avec ses parents."""
+        if folder == "":
+            return self.tree_model.invisibleRootItem()
+        if folder in self._folder_items:
+            return self._folder_items[folder]
+        head, _, name = folder.rpartition("/")
+        item = QtGui.QStandardItem(theme.icon("open"), name)
+        item.setEditable(False)
+        item.setData(("folder", folder, None), REF_ROLE)
+        self._folder_item(head).appendRow(item)
+        self._folder_items[folder] = item
+        return item
+
+    def target_folder(self) -> str:
+        """Sous-répertoire où ranger une nouvelle mesure : celui de la sélection."""
+        ref = self.selected_ref()
+        if not ref:
+            return ""
+        if ref[0] == "folder":
+            return "" if ref[1] == EXTERNAL else ref[1]
+        capture = self.library.capture(ref[1])
+        return (self.library.relative_folder(capture) or "") if capture else ""
 
     @staticmethod
     def _make_item(name, visible, icon_name, color, ref) -> QtGui.QStandardItem:
@@ -292,14 +358,15 @@ class MainController(QtCore.QObject):
 
     def selected_ref(self):
         index = self.view.tree.currentIndex()
-        return index.data(REF_ROLE) if index.isValid() else None
+        ref = index.data(REF_ROLE) if index.isValid() else None
+        return tuple(ref) if ref else None
 
     def selected(self) -> tuple[Capture | None, ModelFit | None]:
         """(capture, modèle) sélectionnés ; modèle None si une capture est sélectionnée."""
         return self._resolve(self.selected_ref())
 
     def _resolve(self, ref) -> tuple[Capture | None, ModelFit | None]:
-        if not ref:
+        if not ref or ref[0] == "folder":
             return None, None
         capture = self.library.capture(ref[1])
         if capture is None:
@@ -444,7 +511,10 @@ class MainController(QtCore.QObject):
         if capture is None:
             self._error("Sélectionnez d'abord une capture.")
             return
-        model = ModelFit(f_min=float(capture.f[0]), f_max=float(capture.f[-1]))
+        model = ModelFit(kind=self.options["default_kind"],
+                         auto_order=bool(self.options["default_auto_order"]),
+                         parallel_cap=bool(self.options["default_parallel_cap"]),
+                         f_min=float(capture.f[0]), f_max=float(capture.f[-1]))
         names = {m.name for m in capture.models}
         n = 1
         while f"{model.kind} {n}" in names:
@@ -499,6 +569,85 @@ class MainController(QtCore.QObject):
             return
         capture.to_csv(path)
         self._status(f"Capture exportée : {path}")
+
+    # ------------------------------------------------------------------ menu Fichier
+    def open_files(self):
+        """Ouvre des captures (.json), y compris situées hors de la librairie."""
+        paths = self._ask_open_paths("Ouvrir une capture", "Capture RLCmeter (*.json)")
+        last, errors = None, []
+        for path in paths:
+            try:
+                last = self.library.open_file(path)
+            except LibraryError as error:
+                errors.append(str(error))
+        if last is not None:
+            self._rebuild_tree(select=("capture", last.id, None))
+        if errors:
+            self._error("\n".join(errors))
+
+    def save_capture_as(self):
+        """Copie la capture sélectionnée (avec ses modèles) dans un fichier choisi."""
+        capture, _ = self.selected()
+        if capture is None:
+            self._error("Sélectionnez d'abord une capture.")
+            return
+        path = self._ask_save_path("Sauvegarder la capture sous",
+                                   f"{spice.subckt_name(capture.name)}.json",
+                                   "Capture RLCmeter (*.json)")
+        if not path:
+            return
+        self.library.save_copy(capture, path)
+        self._status(f"Capture copiée : {path}")
+
+    # ------------------------------------------------------------------ menu Utilitaires
+    def open_options(self):
+        dialog = options_panel.OptionsPannel(self.schema, self.options, self.view)
+        dialog.accepted.connect(lambda: self.apply_options(dialog.getOptions()))
+        self._dialogs.append(dialog)
+        dialog.finished.connect(lambda *_: self._dialogs.remove(dialog))
+        dialog.show()
+        return dialog
+
+    def apply_options(self, options: dict):
+        """Nouvelles options ; un changement de répertoire recharge la librairie."""
+        options = dict(options)
+        if not str(options.get("library_dir") or "").strip():
+            options["library_dir"] = self.options["library_dir"]
+        changed = pathlib.Path(options["library_dir"]) != self.library.folder
+        self.options.update(options)
+        self._save_settings()
+        if changed:
+            self.library = Library(self.options["library_dir"])
+            self.library.load()
+            if self.filter_ctrl is not None:
+                self.filter_ctrl.library = self.library
+            self._rebuild_tree()
+            self._status(f"Librairie : {self.library.folder} "
+                         f"({len(self.library.captures)} capture(s))")
+
+    def open_filter(self):
+        if self.filter_ctrl is None:
+            from controller.filter_controller import FilterController
+            self.filter_ctrl = FilterController(self.library, self.view)
+        self.filter_ctrl.show()
+
+    # ------------------------------------------------------------------ menu Aide
+    def show_tutorial(self):
+        browser = QtWidgets.QTextBrowser(self.view)
+        browser.setWindowFlag(QtCore.Qt.WindowType.Window)
+        browser.setWindowTitle("RLCmeter — tutoriel")
+        browser.setMarkdown((ROOT / "docs" / "tutoriel.md").read_text(encoding="utf-8"))
+        browser.resize(760, 720)
+        browser.show()
+        self._dialogs.append(browser)
+        return browser
+
+    def show_about(self):
+        QtWidgets.QMessageBox.about(
+            self.view, "À propos de RLCmeter",
+            "<b>RLCmeter</b><br>Mesure d'impédance avec un HP 4194A (GPIB), modélisation "
+            "Foster / Cauer et estimation de filtres.<br><br>"
+            f"Librairie : {self.library.folder}")
 
     # ------------------------------------------------------------------ graphes
     def _refresh_graph(self, *_):
@@ -573,4 +722,6 @@ class MainController(QtCore.QObject):
         if self._worker is not None:
             self._worker.cancel()
             self._worker.wait(5000)
+        if self.filter_ctrl is not None:
+            self.filter_ctrl.view.close()
         self._save_settings()
