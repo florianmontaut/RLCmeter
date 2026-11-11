@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+  <!-- onde -->
+  <path d="M2 15c2-4 4 4 6 0s4-4 6 0 4 4 6 0" stroke-width="2"/>
+  <!-- engrenage -->
+  <circle cx="18" cy="6" r="2"/>
+  <path d="M18 2v1.5M18 8.5V10M14 6h1.5M20.5 6H22"/>
+</svg>
