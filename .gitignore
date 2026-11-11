@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# réglages locaux de l'application (liaison, adresse GPIB, thème)
+settings.json
