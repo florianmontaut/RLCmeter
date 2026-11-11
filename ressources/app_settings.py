@@ -17,9 +17,10 @@ def schema(default_library: str) -> dict:
                 "Nouveau modèle": {
                     "type": "group",
                     "children": {
-                        "Type": {
+                        # un condensateur mesuré reçoit toujours le modèle « Condensateur »
+                        "Type pour une inductance": {
                             "type": "list",
-                            "limits": list(fit.KINDS),
+                            "limits": list(fit.INDUCTOR_KINDS),
                             "default": "Foster",
                             "key": "default_kind",
                         },
@@ -28,7 +29,7 @@ def schema(default_library: str) -> dict:
                             "default": True,
                             "key": "default_auto_order",
                         },
-                        "Capacité parallèle": {
+                        "Capacité parallèle (inductance)": {
                             "type": "bool",
                             "default": True,
                             "key": "default_parallel_cap",

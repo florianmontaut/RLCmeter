@@ -57,14 +57,15 @@ DISPLAY_MODES = {
 @dataclass
 class ModelFit:
     """Réglages et résultat d'un fit (voir model/fit.py)."""
-    kind: str = "Foster"            # "Foster" ou "Cauer"
+    kind: str = "Foster"            # "Foster", "Cauer" ou "Condensateur"
     f_min: float = 0.0
     f_max: float = 0.0
     auto_order: bool = True         # ordre choisi par critère AIC
-    nr: int = 1                     # nombre de cellules R-L
-    parallel_cap: bool = True       # branche Rp // Cp
+    nr: int = 1                     # ordre : cellules R-L, ou branches R-C (condensateur)
+    # option parallèle : Rp // Cp d'une inductance, résistance de fuite d'un condensateur
+    parallel_cap: bool = True
     nc: int = 0                     # 0 ou 1 (résultat)
-    params: list = field(default_factory=list)     # [R0, L0, R1, L1, ..., Rp, Cp]
+    params: list = field(default_factory=list)     # vecteur x de model/fit.py
     rel_err: float | None = None    # erreur relative moyenne |Zmod - Z| / |Z|
     aic: float | None = None
     name: str = ""

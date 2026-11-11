@@ -176,7 +176,7 @@ def test_options_change_the_library_folder(app, tmp_path, monkeypatch):
     assert dialog.getOptions()["library_dir"] == str(tmp_path / "library")
     root = dialog.parameter_roots["Modèles"]
     root.child("Répertoire des mesures et modèles").setValue(str(other))
-    root.child("Nouveau modèle", "Type").setValue("Cauer")
+    root.child("Nouveau modèle", "Type pour une inductance").setValue("Cauer")
     root.child("Nouveau modèle", "Ordre automatique").setValue(False)
     dialog.accept()
 
@@ -197,7 +197,7 @@ def test_options_change_the_library_folder(app, tmp_path, monkeypatch):
 def test_cancelled_options_change_nothing(app, tmp_path, monkeypatch):
     ctrl = make(tmp_path, monkeypatch)
     dialog = ctrl.open_options()
-    dialog.parameter_roots["Modèles"].child("Nouveau modèle", "Type").setValue("Cauer")
+    dialog.parameter_roots["Modèles"].child("Nouveau modèle", "Type pour une inductance").setValue("Cauer")
     dialog.reject()
     assert ctrl.options["default_kind"] == "Foster"
 

@@ -440,9 +440,12 @@ class MainController(QtCore.QObject):
                 dict(name="Fréquence min", value=model.f_min, limits=limits, **FREQ),
                 dict(name="Fréquence max", value=model.f_max, limits=limits, **FREQ),
                 dict(name="Ordre automatique", type="bool", value=model.auto_order),
-                dict(name="Cellules R-L", type="int", value=model.nr,
-                     limits=(fit.NR_MIN, fit.NR_MAX), enabled=not model.auto_order),
-                dict(name="Capacité parallèle", type="bool", value=model.parallel_cap),
+                # titres selon le type : cellules R-L / branches R-C, capacité / fuite
+                dict(name="Ordre", title=fit.order_label(model.kind), type="int",
+                     value=model.nr, limits=fit.order_range(model.kind),
+                     enabled=not model.auto_order),
+                dict(name="Branche parallèle", title=fit.parallel_label(model.kind),
+                     type="bool", value=model.parallel_cap),
             ]),
             dict(name="Résultat", type="group", children=self._result_children(model)),
         ])
@@ -458,11 +461,18 @@ class MainController(QtCore.QObject):
         children = [dict(name="Erreur relative moyenne", type="str", readonly=True,
                          value=f"{100 * model.rel_err:.3f} %"),
                     dict(name="Ordre retenu", type="str", readonly=True,
-                         value=f"{model.nr} cellule(s) R-L"
-                               + (", avec Rp // Cp" if model.nc else ""))]
-        for (name, unit), value in zip(fit.param_names(model.nr, model.nc), model.params):
+                         value=fit.describe_order(model.kind, model.nr, model.nc))]
+        names = fit.param_names(model.kind, model.nr, model.nc)
+        for (name, unit), value in zip(names, model.params):
             children.append(dict(name=name, type="float", value=value, siPrefix=True,
                                  suffix=unit, decimals=5, readonly=True))
+        if model.kind == fit.CAPACITOR:
+            # résonance série du modèle ; hors de la bande du fit, l'ESL n'est pas mesurée
+            f_res = 1.0 / (2.0 * np.pi * np.sqrt(model.params[1] * model.params[2]))
+            note = "" if model.f_min <= f_res <= model.f_max else \
+                " (hors de la plage du fit : ESL peu fiable)"
+            children.append(dict(name="Résonance série", type="str", readonly=True,
+                                 value=pg.siFormat(f_res, precision=4, suffix="Hz") + note))
         return children
 
     def _on_model_settings_changed(self, capture: Capture, model: ModelFit):
@@ -477,17 +487,24 @@ class MainController(QtCore.QObject):
     def _apply_model_settings(self, capture: Capture, model: ModelFit):
         g = self._model_group
         f_min, f_max = sorted((float(g["Fréquence min"]), float(g["Fréquence max"])))
+        kind_changed = g["Type"] != model.kind
         model.kind = g["Type"]
         model.f_min, model.f_max = f_min, f_max
         model.auto_order = bool(g["Ordre automatique"])
-        model.parallel_cap = bool(g["Capacité parallèle"])
+        model.parallel_cap = bool(g["Branche parallèle"])
         if not model.auto_order:
-            model.nr = int(g["Cellules R-L"])
+            low, high = fit.order_range(model.kind)
+            model.nr = int(min(max(g["Ordre"], low), high))
         self._run_fit(capture, model)
         # mise à jour sur place (sans reconstruire l'arbre des paramètres en cours d'édition)
         with g.treeChangeBlocker():
-            g.child("Cellules R-L").setOpts(enabled=not model.auto_order)
-            g.child("Cellules R-L").setValue(model.nr)
+            order = g.child("Ordre")
+            if kind_changed:
+                order.setOpts(title=fit.order_label(model.kind))
+                order.setLimits(fit.order_range(model.kind))
+                g.child("Branche parallèle").setOpts(title=fit.parallel_label(model.kind))
+            order.setOpts(enabled=not model.auto_order)
+            order.setValue(model.nr)
         result = self._selection_param.child("Résultat")
         result.clearChildren()
         result.addChildren(self._result_children(model))
@@ -511,9 +528,14 @@ class MainController(QtCore.QObject):
         if capture is None:
             self._error("Sélectionnez d'abord une capture.")
             return
-        model = ModelFit(kind=self.options["default_kind"],
+        if fit.is_capacitive(capture.f, capture.z):
+            # condensateur : résistance de fuite décochée par défaut
+            kind, parallel = fit.CAPACITOR, False
+        else:
+            kind = self.options["default_kind"]
+            parallel = bool(self.options["default_parallel_cap"])
+        model = ModelFit(kind=kind, parallel_cap=parallel,
                          auto_order=bool(self.options["default_auto_order"]),
-                         parallel_cap=bool(self.options["default_parallel_cap"]),
                          f_min=float(capture.f[0]), f_max=float(capture.f[-1]))
         names = {m.name for m in capture.models}
         n = 1

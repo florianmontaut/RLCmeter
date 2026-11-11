@@ -6,8 +6,9 @@ les composants mesurés.
 
 ## 1. Faire une mesure
 
-1. Dans le panneau **Acquisition** (à droite), choisir la liaison : `Simulation` pour
-   essayer sans appareil, `GPIB` avec l'adresse de l'analyseur (17 par défaut).
+1. Dans le panneau **Acquisition** (à droite), choisir la liaison : `Simulation`
+   (inductance) ou `Simulation (condensateur)` pour essayer sans appareil, `GPIB` avec
+   l'adresse de l'analyseur (17 par défaut).
 2. **Tester la liaison** : la ligne *Appareil* affiche la réponse de l'analyseur.
 3. Régler la plage de fréquence, le nombre de points (401 au plus) et le temps
    d'intégration. La *durée estimée* du balayage est affichée.
@@ -31,10 +32,27 @@ la librairie (*Utilitaires > Options*, onglet *Modèles*).
 
 Sélectionner une capture puis **Ajuster un modèle** (Ctrl+M).
 
-- **Type** : Foster ou Cauer (identiques avec une seule cellule R-L).
+Le type proposé dépend de la mesure : *Condensateur* si elle est capacitive en bas de
+bande, sinon le type d'inductance choisi dans les options.
+
 - **Plage de fréquence** : dans la table, ou en déplaçant la zone colorée du graphe.
-- **Ordre automatique** : essaie 1 à 3 cellules R-L et garde le meilleur compromis (AIC).
-- **Capacité parallèle** : à activer si la résonance propre est dans la plage.
+- **Ordre automatique** : essaie les ordres possibles et garde le plus simple qui suffit
+  (critère AIC).
+
+**Inductance** — Foster ou Cauer (identiques avec une seule cellule R-L) :
+R0 + L0 en série avec 1 à 3 cellules R-L, qui traduisent la résistance qui monte avec la
+fréquence (effet de peau, de proximité). *Capacité parallèle* : à activer si la résonance
+propre est dans la plage.
+
+**Condensateur** — ESR + ESL en série avec C0, plus 0 à 2 branches R-C en parallèle sur C0 :
+
+- 0 branche : simple RLC série (polypropylène, céramique C0G) ;
+- 1 ou 2 branches : capacité et pertes qui varient avec la fréquence (électrochimique) ;
+- *Résistance de fuite* : résistance en parallèle sur C0, à activer si les pertes en
+  basse fréquence sont visibles.
+
+L'ESR et l'ESL sont déterminées à la résonance série : si elle est hors de la plage du
+fit, la ligne *Résonance série* le signale et l'ESL n'est pas fiable.
 
 Le fit est relancé à chaque changement. **Exporter .subckt** produit un sous-circuit
 utilisable dans LTspice.

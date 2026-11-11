@@ -30,8 +30,9 @@ WAIT_STATUS = "Octet d'état"
 WAIT_MODES = (WAIT_ESTIMATED, WAIT_STATUS)
 
 LINK_SIMULATION = "Simulation"
+LINK_SIMULATION_CAPACITOR = "Simulation (condensateur)"
 LINK_GPIB = "GPIB"
-LINKS = (LINK_SIMULATION, LINK_GPIB)
+LINKS = (LINK_SIMULATION, LINK_SIMULATION_CAPACITOR, LINK_GPIB)
 
 F_MIN, F_MAX = 100.0, 40e6          # plage de l'appareil en mesure d'impédance
 POINTS_MIN, POINTS_MAX = 2, 401
@@ -218,16 +219,21 @@ class HP4194A:
 # --------------------------------------------------------------------------- simulation
 class SimulatedInstrument:
     """
-    Faux 4194A : renvoie l'impédance d'une inductance à pertes (modèle de Foster à deux
-    cellules, résonance propre vers 7 MHz) avec un peu de bruit de mesure.
+    Faux 4194A, avec un peu de bruit de mesure. Composant simulé au choix :
+        - inductance à pertes (Foster à deux cellules, résonance propre vers 7 MHz) ;
+        - condensateur électrochimique 100 µF (ESR 60 mOhm, ESL 15 nH, une branche R-C,
+          résonance série vers 130 kHz).
     """
-    PARAMS = [0.05, 8e-6, 0.4, 1.5e-6, 6.0, 0.6e-6, 40e3, 50e-12]
-    NR, NC = 2, 1
+    COMPONENTS = {
+        "inductor": ("Foster", [0.05, 8e-6, 0.4, 1.5e-6, 6.0, 0.6e-6, 40e3, 50e-12], 2, 1),
+        "capacitor": ("Condensateur", [0.06, 15e-9, 80e-6, 0.5, 20e-6], 1, 0),
+    }
     NOISE = 0.003
     MAX_DURATION = 1.5          # la simulation ne fait pas attendre un vrai balayage
 
-    def __init__(self, seed=None):
+    def __init__(self, seed=None, component: str = "inductor"):
         self._rng = np.random.default_rng(seed)
+        self.kind, self.params, self.nr, self.nc = self.COMPONENTS[component]
 
     def open(self) -> None:
         pass
@@ -252,7 +258,7 @@ class SimulatedInstrument:
             f = np.geomspace(settings.start, settings.stop, settings.points)
         else:
             f = np.linspace(settings.start, settings.stop, settings.points)
-        z = impedance("Foster", f, self.PARAMS, self.NR, self.NC)
+        z = impedance(self.kind, f, self.params, self.nr, self.nc)
         noise = self._rng.normal(0, self.NOISE, f.size) + 1j * self._rng.normal(
                                                                 0, self.NOISE, f.size)
         return f, z * (1 + noise)
@@ -262,6 +268,8 @@ def open_instrument(link: str, address: int = 17):
     """Instrument (non encore ouvert) pour le type de liaison choisi."""
     if link == LINK_SIMULATION:
         return SimulatedInstrument()
+    if link == LINK_SIMULATION_CAPACITOR:
+        return SimulatedInstrument(component="capacitor")
     if link == LINK_GPIB:
         return HP4194A(address)
     raise InstrumentError(f"Type de liaison inconnu : {link}")

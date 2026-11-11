@@ -66,8 +66,8 @@ def test_fit_workflow(ctrl, tmp_path, monkeypatch):
     # changement de réglage : le fit est relancé et le résultat affiché suit
     group = ctrl._model_group
     group.child("Ordre automatique").setValue(False)
-    group.child("Cellules R-L").setValue(1)
-    group.child("Capacité parallèle").setValue(False)
+    group.child("Ordre").setValue(1)
+    group.child("Branche parallèle").setValue(False)
     assert (model.auto_order, model.nr, model.nc) == (False, 1, 0)
     assert len(model.params) == 4
     names = [p.name() for p in ctrl._selection_param.child("Résultat").children()]

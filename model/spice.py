@@ -16,6 +16,18 @@ def subckt(name: str, kind: str, params, nr: int, nc: int, comment: str = "") ->
     x = list(params)
     lines = [f"* {comment}"] if comment else []
     lines.append(f".subckt {subckt_name(name)} 1 2")
+    if kind == "Condensateur":
+        # ESR et ESL en série, puis C0 avec ses branches Rk-Ck (et la fuite) en parallèle
+        lines.append(f"Resr 1 a {x[0]:.6g}")
+        lines.append(f"Lesl a b {x[1]:.6g} Rser=0")
+        lines.append(f"C0 b 2 {x[2]:.6g}")
+        for k in range(1, nr + 1):
+            lines.append(f"R{k} b c{k} {x[1 + 2 * k]:.6g}")
+            lines.append(f"C{k} c{k} 2 {x[2 + 2 * k]:.6g}")
+        if nc:
+            lines.append(f"Rf b 2 {x[3 + 2 * nr]:.6g}")
+        lines.append(f".ends {subckt_name(name)}")
+        return "\n".join(lines) + "\n"
     lines.append(f"R0 1 a {x[0]:.6g}")
     cells = [(x[2 + 2 * k], x[3 + 2 * k]) for k in range(nr)]
 

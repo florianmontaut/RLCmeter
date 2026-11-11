@@ -33,7 +33,7 @@ Le tutoriel complet est dans `docs/tutoriel.md` (menu Aide, F1).
 |---|---|
 | `instrument/hp4194a.py` | pilote VISA du 4194A et instrument simulé |
 | `model/capture.py` | capture (Z complexe), grandeurs dérivées, réglages d'un modèle |
-| `model/fit.py` | modèles Foster / Cauer, fit, choix de l'ordre par AIC |
+| `model/fit.py` | modèles d'inductance (Foster / Cauer) et de condensateur, fit, choix de l'ordre par AIC |
 | `model/library.py` | librairie de captures sur disque |
 | `model/spice.py` | export `.subckt` |
 | `model/filter.py` | réponse d'un filtre en échelle (matrices chaîne) |

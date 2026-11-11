@@ -49,7 +49,7 @@ def test_model_limits():
     assert z_hf.imag == pytest.approx(2 * np.pi * 1e12 * 1e-5, rel=1e-6)
 
 
-@pytest.mark.parametrize("kind", fit.KINDS)
+@pytest.mark.parametrize("kind", fit.INDUCTOR_KINDS)
 def test_fit_recovers_a_known_model(kind):
     truth = [0.05, 8e-6, 0.4, 1.5e-6, 6.0, 0.6e-6]
     z = fit.impedance(kind, F, truth, 2, 0)
