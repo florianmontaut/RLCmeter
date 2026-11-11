@@ -1,14 +1,11 @@
 """Modèle de condensateur : RLC série + branches R-C en parallèle sur C0."""
 import numpy as np
 import pytest
-from PyQt6 import QtCore, QtWidgets
 
-from controller.main_controller import MainController
 from instrument import hp4194a
-from instrument.hp4194a import SimulatedInstrument, SweepSettings
+from instrument.hp4194a import SweepSettings
 from model import filter as flt
 from model import fit, spice
-from view.main_window import MainWindow
 
 CAP = fit.CAPACITOR
 F = np.geomspace(100, 40e6, 400)
@@ -127,73 +124,3 @@ def test_simulated_capacitor():
     assert fit.is_capacitive(f, z)
     result = fit.fit_auto(f, z, kind=CAP, parallel_cap=False)
     assert result.nr == 1 and result.params[2] == pytest.approx(80e-6, rel=0.03)
-
-
-# --------------------------------------------------------------------------- interface
-@pytest.fixture(scope="session")
-def app():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-
-def measure(ctrl, link):
-    ctrl.acq.child("Liaison").setValue(link)
-    ctrl.toggle_measure()
-    loop = QtCore.QEventLoop()
-    ctrl._worker.finished.connect(loop.quit)
-    QtCore.QTimer.singleShot(10000, loop.quit)
-    loop.exec()
-    QtWidgets.QApplication.processEvents()
-
-
-def test_capacitor_workflow_in_the_interface(app, tmp_path, monkeypatch):
-    monkeypatch.setattr(SimulatedInstrument, "MAX_DURATION", 0.0)
-    ctrl = MainController(MainWindow(), tmp_path / "library", tmp_path / "settings.json")
-    ctrl.errors = []
-    monkeypatch.setattr(ctrl, "_error", ctrl.errors.append)
-    ctrl.acq.child("Fréquence stop").setValue(40e6)
-
-    # une mesure capacitive reçoit d'office le modèle « Condensateur », sans fuite
-    measure(ctrl, hp4194a.LINK_SIMULATION_CAPACITOR)
-    ctrl.add_model()
-    capture, model = ctrl.selected()
-    assert (model.kind, model.name, model.parallel_cap) == (CAP, "Condensateur 1", False)
-    assert model.fitted and model.nr == 1 and model.rel_err < 0.01
-
-    group = ctrl._model_group
-    assert group.child("Ordre").opts["title"] == "Branches R-C"
-    assert group.child("Ordre").opts["limits"] == (0, 2)
-    assert group.child("Branche parallèle").opts["title"] == "Résistance de fuite"
-    names = [p.name() for p in ctrl._selection_param.child("Résultat").children()]
-    assert names[2:] == ["ESR", "ESL", "C0", "R1", "C1", "Résonance série"]
-    assert "hors" not in ctrl._selection_param.child("Résultat", "Résonance série").value()
-
-    # ordre imposé à 0 : simple RLC
-    group.child("Ordre automatique").setValue(False)
-    group.child("Ordre").setValue(0)
-    assert model.nr == 0 and len(model.params) == 3
-
-    # plage réduite sous la résonance : l'ESL est signalée peu fiable
-    group.child("Fréquence max").setValue(10e3)
-    assert "ESL peu fiable" in ctrl._selection_param.child("Résultat",
-                                                           "Résonance série").value()
-
-    # passage à un modèle d'inductance : libellés, limites et ordre suivent
-    group.child("Type").setValue("Foster")
-    assert model.kind == "Foster" and model.nr == 1
-    assert group.child("Ordre").opts["title"] == "Cellules R-L"
-    assert group.child("Ordre").opts["limits"] == (1, 3)
-    assert group.child("Branche parallèle").opts["title"] == "Capacité parallèle"
-    group.child("Type").setValue(CAP)
-    assert model.kind == CAP and model.fitted
-
-    # export LTspice
-    target = tmp_path / "c.lib"
-    monkeypatch.setattr(ctrl, "_ask_save_path", lambda *a: str(target))
-    ctrl.export_subckt()
-    assert "Lesl a b" in target.read_text(encoding="utf-8")
-
-    # une inductance garde le type choisi dans les options
-    measure(ctrl, hp4194a.LINK_SIMULATION)
-    ctrl.add_model()
-    assert ctrl.selected()[1].kind == "Foster"
-    assert ctrl.errors == []

@@ -1,7 +1,13 @@
 # controller/filter_controller.py
 """
-Création de filtre : choix d'une topologie et d'un composant par branche (capture, modèle
-ajusté ou composant idéal), calcul de la réponse (model/filter.py) et affichage.
+Création de filtre : choix d'une topologie et d'un composant par branche, calcul de la
+réponse (model/filter.py) et affichage.
+
+Composants proposés, pour chaque composant de la librairie et de la session :
+    - « ★ nom » : son modèle de référence (le choix par défaut) ;
+    - « Mesure : ... » : une de ses mesures, interpolée ;
+    - « Modèle : ... » : un de ses autres modèles ajustés ;
+puis les composants idéaux R, L et C.
 """
 from __future__ import annotations
 
@@ -9,8 +15,8 @@ import pyqtgraph as pg
 from pyqtgraph.parametertree import Parameter
 from PyQt6 import QtCore
 
+from model import component as cmp
 from model import filter as flt
-from model.library import Library
 from ressources import theme
 from view.filter_window import FilterWindow
 
@@ -22,12 +28,14 @@ OHM = dict(type="float", siPrefix=True, suffix="Ω", dec=True, step=0.5, decimal
 
 class FilterController(QtCore.QObject):
 
-    def __init__(self, library: Library, parent_view=None):
+    def __init__(self, get_components, parent_view=None):
+        """get_components : callable() -> composants disponibles (librairie et session)."""
         super().__init__()
-        self.library = library
+        self.get_components = get_components
         self.view = FilterWindow(parent_view)
         self.response = None                # dernière réponse calculée (FilterResponse)
         self._sources = {}                  # libellé -> fabrique de Component
+        self._kinds = {}
         self._building = False
         self.params = None
         self._build_params()
@@ -41,17 +49,36 @@ class FilterController(QtCore.QObject):
 
     # ------------------------------------------------------------------ composants
     def _collect_sources(self) -> dict:
-        """Composants disponibles : mesures et modèles de la librairie, puis idéaux."""
+        """Libellé -> fabrique de Component ; None pour un composant idéal."""
         sources = {}
-        for capture in self.library.captures:
-            sources[f"Mesure : {capture.name}"] = (
-                lambda c=capture: flt.Measured(c.name, c.f, c.z))
-            for model in capture.models:
-                if model.fitted:
-                    sources[f"Modèle : {capture.name} / {model.name}"] = (
-                        lambda c=capture, m=model: flt.Modelled(
-                            f"{c.name} / {m.name}", m.kind, tuple(m.params), m.nr, m.nc,
-                            m.f_min, m.f_max))
+        self._kinds = {}                    # libellé -> type du composant (choix par défaut)
+
+        def add(label, component, factory):
+            if label in sources:            # deux composants de même nom
+                label = f"{label} [{component.id[:4]}]"
+            sources[label] = factory
+            self._kinds[label] = component.kind or component.detect_kind()
+
+        def modelled(name, m):
+            return lambda: flt.Modelled(name, m.kind, tuple(m.params), m.nr, m.nc,
+                                        m.f_min, m.f_max)
+
+        components = sorted(self.get_components(), key=lambda c: c.name.casefold())
+        for component in components:
+            found = component.reference_model()
+            if found is not None:
+                add(f"★ {component.name}", component, modelled(component.name, found[1]))
+        for component in components:
+            single = len(component.captures) == 1
+            reference = component.reference_model()
+            for capture in component.captures:
+                name = component.name if single and component.name == capture.name                     else f"{component.name} / {capture.name}"
+                add(f"Mesure : {name}", component,
+                    lambda c=capture, n=name: flt.Measured(n, c.f, c.z))
+                for model in capture.models:
+                    if model.fitted and not (reference and reference[1] is model):
+                        add(f"Modèle : {name} / {model.name}", component,
+                            modelled(f"{name} / {model.name}", model))
         for label in IDEAL_LABELS:
             sources[label] = None           # construit avec la valeur saisie
         return sources
@@ -75,11 +102,14 @@ class FilterController(QtCore.QObject):
         self.compute()
 
     def _default_source(self, position: str) -> str:
-        """Par défaut : une mesure en série (self), une capacité idéale en parallèle."""
-        if position == flt.SHUNT:
-            return "C idéale"
-        return next((label for label in self._sources if label.startswith("Mesure")),
-                    "L idéale")
+        """
+        Par défaut : une inductance en série, un condensateur en parallèle, pris parmi
+        les composants disponibles (modèle de référence d'abord), sinon idéaux.
+        """
+        wanted = cmp.CAPACITOR if position == flt.SHUNT else cmp.INDUCTOR
+        fallback = "C idéale" if position == flt.SHUNT else "L idéale"
+        return next((label for label in self._sources
+                     if self._kinds.get(label) == wanted), fallback)
 
     # ------------------------------------------------------------------ paramètres
     def _build_params(self):

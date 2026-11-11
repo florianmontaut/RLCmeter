@@ -1,9 +1,14 @@
 # controller/main_controller.py
 """
-Relie la librairie (captures et modèles), l'arborescence, les graphes et les paramètres.
-    - mesure : AcquisitionWorker -> nouvelle capture dans la librairie ;
-    - fit : ModelFit attaché à la capture, recalculé à chaque changement de réglage ;
-    - affichage : les captures et modèles cochés, dans le mode choisi (Ls-Rs...).
+Relie les composants (mesures et modèles), les deux vues de gauche, les graphes et les
+paramètres.
+
+    - Session (en haut) : les mesures faites depuis l'ouverture. Chacune est enregistrée
+      aussitôt dans le répertoire des brouillons, sous forme d'un composant à fiche vide.
+    - Librairie (en bas) : les composants caractérisés, triables et filtrables. Une mesure
+      de la session y entre par « Ajouter à la librairie », qui demande sa fiche.
+    - Fit : ModelFit attaché à sa mesure, recalculé à chaque changement de réglage.
+    - Graphes : les mesures cochées et l'élément sélectionné, dans le mode choisi.
 """
 from __future__ import annotations
 
@@ -15,20 +20,22 @@ import pyqtgraph as pg
 from pyqtgraph.parametertree import Parameter
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from controller import library_view as lv
 from controller.acquisition import AcquisitionWorker
+from controller.library_view import REF_ROLE, SEARCH_ROLE, SORT_ROLE
 from instrument import hp4194a
 from instrument.hp4194a import InstrumentError, SweepSettings, open_instrument
+from model import component as cmp
 from model import fit, spice
+from model import library as lib
 from model.capture import DISPLAY_MODES, Capture, ModelFit
+from model.component import Component
 from model.library import Library, LibraryError
 from ressources import app_settings, options_panel, theme
+from version import VERSION
+from view.component_dialog import ComponentDialog
 from view.main_window import MainWindow
 
-# rôle de l'arbre : ("capture", id capture, None), ("model", id capture, id modèle)
-# ou ("folder", chemin relatif dans la librairie, None)
-REF_ROLE = QtCore.Qt.ItemDataRole.UserRole + 1
-
-EXTERNAL = "Hors librairie"      # dossier des captures ouvertes hors de la librairie
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 COLORS = ("#0B6BCB", "#D9480F", "#2B8A3E", "#9C36B5", "#C2255C", "#0C8599", "#E67700",
@@ -36,28 +43,50 @@ COLORS = ("#0B6BCB", "#D9480F", "#2B8A3E", "#9C36B5", "#C2255C", "#0C8599", "#E6
 
 FREQ = dict(type="float", siPrefix=True, suffix="Hz", dec=True, step=0.5, decimals=6)
 
+SESSION, LIBRARY = "session", "library"
+CHECKED, UNCHECKED = QtCore.Qt.CheckState.Checked, QtCore.Qt.CheckState.Unchecked
+
 
 class MainController(QtCore.QObject):
 
-    def __init__(self, view: MainWindow, library_folder, settings_path=None):
+    def __init__(self, view: MainWindow, library_folder, settings_path=None,
+                 drafts_folder=None):
         super().__init__()
         self.view = view
         self.settings_path = pathlib.Path(settings_path) if settings_path else None
+        library_folder = pathlib.Path(library_folder)
+        drafts_folder = pathlib.Path(drafts_folder) if drafts_folder \
+            else library_folder.parent / "brouillons"
         # options (Utilitaires > Options) : valeurs par défaut du schéma, puis settings.json
-        self.schema = app_settings.schema(str(library_folder))
+        self.schema = app_settings.schema(str(library_folder), str(drafts_folder))
         self.options = options_panel.schema_defaults(self.schema)
         self.library = Library(library_folder)
+        self.drafts = Library(drafts_folder)
+        self.session: list[Component] = []  # mesures de la session et fichiers ouverts
         self.filter_ctrl = None             # fenêtre « Création de filtre » (à la demande)
         self._dialogs = []                  # fenêtres ouvertes (options, tutoriel)
         self._worker = None
-        self._rebuilding = False            # arbre en reconstruction : itemChanged ignoré
+        self._rebuilding = False            # vues en reconstruction : signaux ignorés
+        self._active = SESSION              # vue qui porte la sélection
         self._selection_param = None        # paramètres de l'élément sélectionné
-        self._folder_items = {}             # sous-répertoire -> élément de l'arbre
         self._model_group = None            # groupe « Réglages » du modèle affiché
         self._updating_model = False
+        self._closed = False                # fenêtre fermée : plus aucune mise à jour
 
-        self.tree_model = QtGui.QStandardItemModel()
-        view.tree.setModel(self.tree_model)
+        # modèles Qt possédés par leur vue : détruits avec elle, dans le bon ordre, à la
+        # fermeture (sans propriétaire, Python les détruisait au hasard : plantage en sortie)
+        self.session_model = QtGui.QStandardItemModel(view.tree)
+        view.tree.setModel(self.session_model)
+        self.library_model = QtGui.QStandardItemModel(view.libraryTree)
+        self.library_model.setHorizontalHeaderLabels(list(lv.COLUMNS))
+        self.proxy = lv.LibraryFilterProxy(view.libraryTree)
+        self.proxy.setSourceModel(self.library_model)
+        view.libraryTree.setModel(self.proxy)
+        view.libraryTree.sortByColumn(lv.COL_NAME, QtCore.Qt.SortOrder.AscendingOrder)
+        for column, width in ((lv.COL_NAME, 150), (lv.COL_KIND, 88), (lv.COL_TECHNOLOGY, 100),
+                              (lv.COL_MANUFACTURER, 76), (lv.COL_FAY, 76), (lv.COL_VALUE, 70),
+                              (lv.COL_COUNT, 58)):
+            view.libraryTree.setColumnWidth(column, width)
         view.displayCombo.addItems(list(DISPLAY_MODES))
 
         # plage de fréquence du fit, réglable à la souris (abscisses en log10 de f)
@@ -69,13 +98,10 @@ class MainController(QtCore.QObject):
         self._load_settings()
         self._connect()
 
-        self.library = Library(self.options["library_dir"])
-        self.library.load()
-        self._rebuild_tree()
+        self._load_folders()
+        self._rebuild()
         self._apply_theme()
-        if self.library.errors:
-            names = ", ".join(name for name, _ in self.library.errors)
-            self._status(f"Fichiers illisibles ignorés : {names}")
+        self._report_load_errors()
 
     # ------------------------------------------------------------------ initialisation
     def _init_acquisition_params(self):
@@ -112,16 +138,44 @@ class MainController(QtCore.QObject):
         v.actionDelete.triggered.connect(self.delete_selected)
         v.actionDark.toggled.connect(self._apply_theme)
         v.actionOpen.triggered.connect(self.open_files)
-        v.actionSaveAs.triggered.connect(self.save_capture_as)
+        v.actionSaveAs.triggered.connect(self.save_component_as)
         v.actionQuit.triggered.connect(v.close)
+        v.actionAddToLibrary.triggered.connect(self.add_to_library)
+        v.actionEditComponent.triggered.connect(self.edit_component)
+        v.actionShowDrafts.toggled.connect(self._on_show_drafts_toggled)
         v.actionOptions.triggered.connect(self.open_options)
         v.actionFilter.triggered.connect(self.open_filter)
         v.actionTutorial.triggered.connect(self.show_tutorial)
         v.actionAbout.triggered.connect(self.show_about)
         v.displayCombo.currentTextChanged.connect(self._refresh_graph)
-        v.tree.selectionModel().currentChanged.connect(self._on_selection_changed)
-        self.tree_model.itemChanged.connect(self._on_item_changed)
+        # méthodes du contrôleur, pas des lambdas : Qt les déconnecte à sa destruction
+        # (une lambda restait appelée pendant la fermeture, sur des objets déjà détruits)
+        v.tree.selectionModel().currentChanged.connect(self._on_session_current)
+        v.libraryTree.selectionModel().currentChanged.connect(self._on_library_current)
+        v.libraryTree.doubleClicked.connect(self._on_library_double_click)
+        self.session_model.itemChanged.connect(self._on_item_changed)
+        self.library_model.itemChanged.connect(self._on_item_changed)
+        v.searchEdit.textChanged.connect(self._on_filters_changed)
+        for combo in (v.kindFilter, v.technologyFilter, v.manufacturerFilter):
+            combo.currentIndexChanged.connect(self._on_filters_changed)
         v.closing.connect(self._on_closing)
+
+    def _load_folders(self):
+        """Lit la librairie et les brouillons des répertoires choisis dans les options."""
+        self.library = Library(self.options["library_dir"])
+        self.library.load()
+        self.drafts = Library(self.options["drafts_dir"])
+        self.drafts.load()
+        # les fichiers ouverts à la main restent dans la session
+        self.session = [c for c in self.session
+                        if not self.drafts.contains(c) and not self.library.contains(c)
+                        and c.path and pathlib.Path(c.path).exists()]
+
+    def _report_load_errors(self):
+        errors = self.library.errors + self.drafts.errors
+        if errors:
+            names = ", ".join(name for name, _ in errors)
+            self._status(f"Fichiers illisibles ignorés : {names}")
 
     # ------------------------------------------------------------------ réglages
     def _load_settings(self):
@@ -160,7 +214,7 @@ class MainController(QtCore.QObject):
         brush = QtGui.QColor(theme.colors()["accent"])
         brush.setAlpha(30)
         self.region.setBrush(brush)
-        self._rebuild_tree(keep_selection=True)     # icônes de l'arbre à la bonne teinte
+        self._rebuild(keep_selection=True)      # icônes des vues à la bonne teinte
         if self.filter_ctrl is not None:
             self.filter_ctrl.view.apply_graph_theme()
             self.filter_ctrl.compute()
@@ -186,6 +240,27 @@ class MainController(QtCore.QObject):
     def _ask_save_path(self, title: str, name: str, file_filter: str) -> str:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self.view, title, name, file_filter)
         return path
+
+    def _ask_component(self, component: Component, targets=None):
+        """
+        Fiche du composant. Renvoie (champs, composant de destination) ou None si
+        l'utilisateur annule ; la destination n'est proposée qu'à l'ajout (targets).
+        """
+        dialog = ComponentDialog(component, self.library.values("technology"),
+                                 self.library.values("manufacturer"), targets, self.view)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        target = dialog.target()
+        return (None if target is not None else dialog.values()), target
+
+    def _save(self, component: Component) -> bool:
+        """Enregistre le composant ; un échec (répertoire en lecture seule) est signalé."""
+        try:
+            lib.save_component(component, self.drafts.folder)
+        except LibraryError as error:
+            self._status(str(error), 15000)
+            return False
+        return True
 
     # ------------------------------------------------------------------ acquisition
     def sweep_settings(self) -> SweepSettings:
@@ -272,169 +347,409 @@ class MainController(QtCore.QObject):
         self._error(message)
 
     def _on_measure_done(self, f, z, identity: str):
+        """Nouvelle mesure : enregistrée aussitôt en brouillon, affichée dans la session."""
         settings = self._worker.settings if self._worker else self.sweep_settings()
-        capture = Capture(name=self.library.unique_name(self.acq["Nom de la capture"]),
+        capture = Capture(name=self.drafts.unique_name(self.acq["Nom de la capture"]),
                           f=f, z=z, settings=settings.to_dict(), instrument=identity,
-                          color=COLORS[len(self.library.captures) % len(COLORS)])
-        self.library.add(capture, self.target_folder())
+                          color=COLORS[len(self.drafts.components) % len(COLORS)])
+        component = Component.from_capture(capture)
+        try:
+            self.drafts.add(component)
+        except LibraryError as error:
+            # mesure gardée en mémoire : rien n'est perdu tant que le logiciel reste ouvert
+            self._error(f"La mesure n'a pas pu être enregistrée.\n{error}")
+        self.session.append(component)
         with self.acq.treeChangeBlocker():
             self.acq.child("Appareil").setValue(identity)
-        self._rebuild_tree(select=("capture", capture.id, None))
-        self._status(f"Capture « {capture.name} » enregistrée ({capture.f.size} points).")
+        self._rebuild(select=("capture", component.id, capture.id, None))
+        self._status(f"Mesure « {capture.name} » enregistrée en brouillon "
+                     f"({capture.f.size} points).")
 
-    # ------------------------------------------------------------------ arborescence
-    def _rebuild_tree(self, select=None, keep_selection=False):
+    # ------------------------------------------------------------------ composants
+    def session_components(self) -> list[Component]:
+        """Composants de la vue Session (avec les anciens brouillons si demandé)."""
+        if not self.view.actionShowDrafts.isChecked():
+            return list(self.session)
+        shown = list(self.drafts.components)
+        shown += [c for c in self.session if not self.drafts.contains(c)]
+        return shown
+
+    def _on_show_drafts_toggled(self, *_):
+        self._rebuild(keep_selection=True)
+
+    def all_components(self) -> list[Component]:
+        """Tous les composants connus : session, brouillons affichés et librairie."""
+        return self.session_components() + list(self.library.components)
+
+    def find_component(self, component_id: str) -> Component | None:
+        return next((c for c in self.all_components() if c.id == component_id), None)
+
+    def in_library(self, component: Component) -> bool:
+        return self.library.contains(component)
+
+    # ------------------------------------------------------------------ vues de gauche
+    def _rebuild(self, select=None, keep_selection=False):
+        """Reconstruit les vues Session et Librairie, puis rétablit la sélection."""
         if keep_selection:
             select = self.selected_ref()
+        expanded = self._expanded_components()
         self._rebuilding = True
         try:
-            self.tree_model.clear()
-            self._folder_items = {}
-            target = [None]
-
-            def register(item):
-                if select is not None and tuple(select) == tuple(item.data(REF_ROLE)):
-                    target[0] = item
-
-            # sous-répertoires de la librairie, vides compris
-            for folder in self.library.subfolders():
-                self._folder_item(folder)
-            for capture in self.library.captures:
-                folder = self.library.relative_folder(capture)
-                parent = self._folder_item(EXTERNAL if folder is None else folder)
-                item = self._make_item(capture.name, capture.visible, "signal_raw",
-                                       capture.color, ("capture", capture.id, None))
-                parent.appendRow(item)
-                register(item)
-                for model in capture.models:
-                    child = self._make_item(model.name, model.visible, "signal_modified",
-                                            capture.color, ("model", capture.id, model.id))
-                    item.appendRow(child)
-                    register(child)
-            for item in self._folder_items.values():
-                register(item)
+            self._fill_session()
+            self._fill_library()
+            self._fill_filter_choices()
         finally:
             self._rebuilding = False
         self.view.tree.expandAll()
-        if target[0] is not None:
-            self.view.tree.setCurrentIndex(target[0].index())
-        else:
-            self._on_selection_changed()
+        self._restore_expanded(expanded)
+        self._update_count()
+        if not (select and self.select(select)):
+            self._clear_selection()
         if self.filter_ctrl is not None:
             self.filter_ctrl.refresh_sources()
 
-    def _folder_item(self, folder: str):
-        """Élément de l'arbre d'un sous-répertoire (« a/b »), créé avec ses parents."""
-        if folder == "":
-            return self.tree_model.invisibleRootItem()
-        if folder in self._folder_items:
-            return self._folder_items[folder]
-        head, _, name = folder.rpartition("/")
-        item = QtGui.QStandardItem(theme.icon("open"), name)
-        item.setEditable(False)
-        item.setData(("folder", folder, None), REF_ROLE)
-        self._folder_item(head).appendRow(item)
-        self._folder_items[folder] = item
+    def _make_item(self, name, icon_name, color, ref, checked=None, editable=True):
+        item = QtGui.QStandardItem(theme.icon(icon_name, tint=color), name)
+        item.setEditable(editable)
+        item.setData(ref, REF_ROLE)
+        item.setData(name, SORT_ROLE)
+        if checked is not None:
+            item.setCheckable(True)
+            item.setCheckState(CHECKED if checked else UNCHECKED)
         return item
 
-    def target_folder(self) -> str:
-        """Sous-répertoire où ranger une nouvelle mesure : celui de la sélection."""
-        ref = self.selected_ref()
-        if not ref:
-            return ""
-        if ref[0] == "folder":
-            return "" if ref[1] == EXTERNAL else ref[1]
-        capture = self.library.capture(ref[1])
-        return (self.library.relative_folder(capture) or "") if capture else ""
+    def _capture_rows(self, component: Component, capture: Capture, label: str,
+                      editable: bool = True) -> QtGui.QStandardItem:
+        """Élément d'une mesure, avec ses modèles en enfants."""
+        item = self._make_item(label, "signal_raw", capture.color,
+                               ("capture", component.id, capture.id, None),
+                               checked=capture.visible, editable=editable)
+        for model in capture.models:
+            reference = component.is_reference(capture, model)
+            item.appendRow(self._row(self._make_item(
+                model.name, "signal_reference" if reference else "signal_modified",
+                capture.color, ("model", component.id, capture.id, model.id),
+                checked=model.visible), {lv.COL_KIND: model.kind}))
+        return item
 
     @staticmethod
-    def _make_item(name, visible, icon_name, color, ref) -> QtGui.QStandardItem:
-        item = QtGui.QStandardItem(theme.icon(icon_name, tint=color), name)
-        item.setCheckable(True)
-        item.setCheckState(QtCore.Qt.CheckState.Checked if visible
-                           else QtCore.Qt.CheckState.Unchecked)
-        item.setData(ref, REF_ROLE)
-        return item
+    def _cell(text: str = "", sort_key=None) -> QtGui.QStandardItem:
+        cell = QtGui.QStandardItem(text)
+        cell.setEditable(False)
+        cell.setData(text if sort_key is None else sort_key, SORT_ROLE)
+        return cell
 
-    def selected_ref(self):
-        index = self.view.tree.currentIndex()
-        ref = index.data(REF_ROLE) if index.isValid() else None
-        return tuple(ref) if ref else None
+    def _row(self, first: QtGui.QStandardItem, cells: dict | None = None) -> list:
+        """Ligne du tableau de la librairie : première colonne, puis cellules de texte."""
+        cells = cells or {}
+        return [first] + [self._cell(cells.get(column, ""))
+                          for column in range(1, len(lv.COLUMNS))]
 
-    def selected(self) -> tuple[Capture | None, ModelFit | None]:
-        """(capture, modèle) sélectionnés ; modèle None si une capture est sélectionnée."""
-        return self._resolve(self.selected_ref())
+    def _fill_session(self):
+        self.session_model.removeRows(0, self.session_model.rowCount())
+        for component in self.session_components():
+            # brouillon ordinaire : une mesure, qui donne son nom au composant
+            plain = len(component.captures) == 1                 and component.name == component.captures[0].name
+            for capture in component.captures:
+                label = capture.name if plain else f"{component.name} / {capture.name}"
+                self.session_model.appendRow(
+                    self._capture_rows(component, capture, label, editable=plain))
 
-    def _resolve(self, ref) -> tuple[Capture | None, ModelFit | None]:
-        if not ref or ref[0] == "folder":
-            return None, None
-        capture = self.library.capture(ref[1])
-        if capture is None:
-            return None, None
-        return capture, (capture.model(ref[2]) if ref[2] else None)
+    def _fill_library(self):
+        model = self.library_model
+        model.removeRows(0, model.rowCount())
+        for component in self.library.components:
+            first = self._make_item(component.name, "file", None,
+                                    ("component", component.id, None, None), editable=False)
+            first.setData(" ".join((component.part_number, component.comment,
+                                    component.conditions)), SEARCH_ROLE)
+            # valeur : la nominale, sinon celle du modèle de référence (marquée ≈)
+            value = component.nominal if component.nominal is not None \
+                else component.measured_value()
+            text = component.nominal_text() or (
+                f"≈ {component.measured_text()}" if component.measured_text() else "")
+            row = [first,
+                   self._cell(component.kind),
+                   self._cell(component.technology),
+                   self._cell(component.manufacturer),
+                   self._cell(component.fay_code),
+                   self._cell(text, value if value is not None else float("inf")),
+                   self._cell(str(len(component.captures)), len(component.captures)),
+                   self._cell(component.last_date()[:10], component.last_date())]
+            for capture in component.captures:
+                first.appendRow(self._row(
+                    self._capture_rows(component, capture, capture.name),
+                    {lv.COL_DATE: capture.date[:10]}))
+            model.appendRow(row)
 
-    def _on_item_changed(self, item: QtGui.QStandardItem):
-        """Case cochée (affichage) ou nom modifié dans l'arbre."""
+    def _fill_filter_choices(self):
+        """Valeurs proposées dans les filtres de la librairie (choix courant conservé)."""
+        v = self.view
+        for combo, first, values in (
+                (v.kindFilter, "Tous les types", list(cmp.KINDS)),
+                (v.technologyFilter, "Toutes les technologies",
+                 self.library.values("technology")),
+                (v.manufacturerFilter, "Tous les fabricants",
+                 self.library.values("manufacturer"))):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems([first, *values, lv.UNSET])
+            index = combo.findText(current)
+            combo.setCurrentIndex(index if index > 0 else 0)
+            combo.blockSignals(False)
+        self._apply_filters()
+
+    def _apply_filters(self):
+        v = self.view
+        self.proxy.set_search(v.searchEdit.text())
+        for combo, column in ((v.kindFilter, lv.COL_KIND),
+                              (v.technologyFilter, lv.COL_TECHNOLOGY),
+                              (v.manufacturerFilter, lv.COL_MANUFACTURER)):
+            self.proxy.set_column_filter(
+                column, combo.currentText() if combo.currentIndex() > 0 else None)
+
+    def _on_filters_changed(self, *_):
         if self._rebuilding:
             return
-        capture, model = self._resolve(item.data(REF_ROLE))
+        self._apply_filters()
+        self._update_count()
+
+    def clear_filters(self):
+        v = self.view
+        v.searchEdit.clear()
+        for combo in (v.kindFilter, v.technologyFilter, v.manufacturerFilter):
+            combo.setCurrentIndex(0)
+
+    def _update_count(self):
+        shown, total = self.proxy.rowCount(), len(self.library.components)
+        text = f"{total} composant(s)" if shown == total \
+            else f"{shown} composant(s) sur {total}"
+        self.view.libraryCount.setText(text)
+
+    def _expanded_components(self) -> set[str]:
+        """Composants dépliés dans la librairie (rétablis après reconstruction)."""
+        expanded = set()
+        for row in range(self.proxy.rowCount()):
+            index = self.proxy.index(row, 0)
+            if self.view.libraryTree.isExpanded(index):
+                expanded.add(index.data(REF_ROLE)[1])
+        return expanded
+
+    def _restore_expanded(self, expanded: set[str]):
+        tree = self.view.libraryTree
+        for row in range(self.proxy.rowCount()):
+            index = self.proxy.index(row, 0)
+            if index.data(REF_ROLE)[1] in expanded:
+                tree.expand(index)
+                for child in range(self.proxy.rowCount(index)):
+                    tree.expand(self.proxy.index(child, 0, index))
+
+    # ------------------------------------------------------------------ sélection
+    @staticmethod
+    def _find_item(model: QtGui.QStandardItemModel, ref) -> QtGui.QStandardItem | None:
+        def walk(parent):
+            for row in range(parent.rowCount()):
+                item = parent.child(row, 0)
+                if tuple(item.data(REF_ROLE)) == tuple(ref):
+                    return item
+                found = walk(item)
+                if found is not None:
+                    return found
+            return None
+        return walk(model.invisibleRootItem())
+
+    def select(self, ref) -> bool:
+        """Sélectionne un élément dans la vue qui le contient. False s'il est introuvable."""
+        item = self._find_item(self.session_model, ref)
+        if item is not None:
+            self.view.tree.setCurrentIndex(item.index())
+            return True
+        item = self._find_item(self.library_model, ref)
+        if item is None:
+            return False
+        index = self.proxy.mapFromSource(item.index())
+        if not index.isValid():             # masqué par un filtre
+            self.clear_filters()
+            index = self.proxy.mapFromSource(item.index())
+        tree = self.view.libraryTree
+        parent = index.parent()
+        while parent.isValid():
+            tree.expand(parent)
+            parent = parent.parent()
+        tree.setCurrentIndex(index)
+        tree.scrollTo(index)
+        return True
+
+    def _clear_selection(self):
+        self._rebuilding = True
+        try:
+            self.view.tree.setCurrentIndex(QtCore.QModelIndex())
+            self.view.libraryTree.setCurrentIndex(QtCore.QModelIndex())
+        finally:
+            self._rebuilding = False
+        self._on_selection_changed()
+
+    def _on_session_current(self, current: QtCore.QModelIndex, _previous=None):
+        self._on_current_changed(SESSION, current)
+
+    def _on_library_current(self, current: QtCore.QModelIndex, _previous=None):
+        self._on_current_changed(LIBRARY, current)
+
+    def _on_current_changed(self, source: str, current: QtCore.QModelIndex):
+        """Une seule sélection pour les deux vues : la dernière cliquée."""
+        if self._rebuilding or self._closed or not current.isValid():
+            return
+        self._active = source
+        other = self.view.libraryTree if source == SESSION else self.view.tree
+        self._rebuilding = True
+        try:
+            other.setCurrentIndex(QtCore.QModelIndex())
+            other.clearSelection()
+        finally:
+            self._rebuilding = False
+        self._on_selection_changed()
+
+    def selected_ref(self):
+        tree = self.view.tree if self._active == SESSION else self.view.libraryTree
+        index = tree.currentIndex()
+        if not index.isValid():
+            return None
+        ref = index.siblingAtColumn(0).data(REF_ROLE)
+        return tuple(ref) if ref else None
+
+    def _resolve(self, ref) -> tuple[Component | None, Capture | None, ModelFit | None]:
+        if not ref:
+            return None, None, None
+        component = self.find_component(ref[1])
+        if component is None:
+            return None, None, None
+        capture = component.capture(ref[2]) if ref[2] else None
+        model = capture.model(ref[3]) if capture is not None and ref[3] else None
+        return component, capture, model
+
+    def selected(self) -> tuple[Component | None, Capture | None, ModelFit | None]:
+        """(composant, mesure, modèle) sélectionnés ; None pour les niveaux non atteints."""
+        return self._resolve(self.selected_ref())
+
+    def selected_capture(self) -> tuple[Component | None, Capture | None]:
+        """Mesure visée par une action : celle sélectionnée, ou l'unique d'un composant."""
+        component, capture, _ = self.selected()
+        if component is not None and capture is None and len(component.captures) == 1:
+            capture = component.captures[0]
+        return component, capture
+
+    def _on_item_changed(self, item: QtGui.QStandardItem):
+        """Case cochée (affichage) ou nom modifié dans une vue."""
+        if self._rebuilding or self._closed or item.column() != 0:
+            return
+        component, capture, model = self._resolve(item.data(REF_ROLE))
         if capture is None:
             return
         target = model if model is not None else capture
-        target.visible = item.checkState() == QtCore.Qt.CheckState.Checked
+        target.visible = item.checkState() == CHECKED
         name = item.text().strip()
-        if name and name != target.name:
-            target.name = self.library.unique_name(name) if model is None else name
-        if item.text() != target.name:          # nom vide ou déjà pris
+        renamed = bool(name) and name != target.name and item.isEditable()
+        if renamed:
+            target.name = name
+            # brouillon à une seule mesure : le composant porte le nom de sa mesure
+            if model is None and not self.in_library(component) \
+                    and len(component.captures) == 1:
+                component.name = name
+            self._save(component)
+        if item.isEditable() and item.text() != target.name:      # nom vide refusé
             self._rebuilding = True
             item.setText(target.name)
             self._rebuilding = False
-        self.library.save(capture)
         self._refresh_graph()
+        if renamed and self.filter_ctrl is not None:
+            self.filter_ctrl.refresh_sources()
 
     def _on_selection_changed(self, *_):
         self._show_selection_params()
         self._refresh_graph()
+        component, capture, _model = self.selected()
+        v = self.view
+        v.actionAddToLibrary.setEnabled(component is not None
+                                        and not self.in_library(component))
+        v.actionEditComponent.setEnabled(component is not None)
+
+    def _on_library_double_click(self, index: QtCore.QModelIndex):
+        ref = index.siblingAtColumn(0).data(REF_ROLE)
+        if ref and ref[0] == "component":
+            self.edit_component()
 
     # ------------------------------------------------------------------ paramètres
     def _show_selection_params(self):
         self._model_group = None
-        capture, model = self.selected()
-        if capture is None:
+        component, capture, model = self.selected()
+        if component is None:
             self._selection_param = None
             self.view.selectionTree.clear()
             return
-        if model is None:
-            param = self._capture_params(capture)
+        if model is not None:
+            param = self._model_params(component, capture, model)
+        elif capture is not None:
+            param = self._capture_params(component, capture)
         else:
-            param = self._model_params(capture, model)
+            param = self._component_params(component)
         self._selection_param = param
         self.view.selectionTree.setParameters(param, showTop=True)
 
-    def _capture_params(self, capture: Capture) -> Parameter:
+    def _component_params(self, component: Component) -> Parameter:
+        values = {"name": component.name, "kind": component.kind,
+                  "technology": component.technology,
+                  "manufacturer": component.manufacturer,
+                  "part_number": component.part_number, "fay_code": component.fay_code,
+                  "nominal": component.nominal_text(), "conditions": component.conditions,
+                  "comment": component.comment}
+        children = [dict(name=label, type="str", value=values[key] or "", readonly=True)
+                    for key, label in cmp.FIELDS]
+        found = component.reference_model()
+        reference = f"{found[0].name} / {found[1].name}" if found else "aucun"
+        children += [
+            dict(name="Valeur du modèle", type="str", readonly=True,
+                 value=component.measured_text()),
+            dict(name="Modèle de référence", type="str", value=reference, readonly=True),
+            dict(name="Mesures", type="str", value=str(len(component.captures)),
+                 readonly=True),
+            dict(name="Modifier la fiche...", type="action"),
+        ]
+        param = Parameter.create(name=f"Composant : {component.name}", type="group",
+                                 children=children)
+        param.child("Modifier la fiche...").sigActivated.connect(
+            lambda *_: QtCore.QTimer.singleShot(0, self.edit_component))
+        return param
+
+    def _capture_params(self, component: Component, capture: Capture) -> Parameter:
         s = capture.settings
-        info = [("Date", capture.date.replace("T", " ")),
+        info = [("Composant", component.name),
+                ("Date", capture.date.replace("T", " ")),
                 ("Appareil", capture.instrument),
                 ("Points", str(capture.f.size)),
                 ("Plage", f"{pg.siFormat(capture.f[0], suffix='Hz')} à "
                           f"{pg.siFormat(capture.f[-1], suffix='Hz')}"),
                 ("Balayage", "log" if s.get("log") else "linéaire"),
                 ("Intégration", str(s.get("integration", "")))]
-        param = Parameter.create(name=f"Capture : {capture.name}", type="group", children=[
+        param = Parameter.create(name=f"Mesure : {capture.name}", type="group", children=[
             dict(name="Couleur", type="color", value=capture.color),
             *[dict(name=name, type="str", value=value, readonly=True) for name, value in info]])
 
         def on_color(_, value):
             capture.color = QtGui.QColor(value).name()
-            self.library.save(capture)
-            self._rebuild_tree(keep_selection=True)
+            self._save(component)
+            self._rebuild(keep_selection=True)
 
         param.child("Couleur").sigValueChanged.connect(on_color)
         return param
 
-    def _model_params(self, capture: Capture, model: ModelFit) -> Parameter:
+    def _model_params(self, component: Component, capture: Capture,
+                      model: ModelFit) -> Parameter:
         limits = (float(capture.f[0]), float(capture.f[-1]))
         param = Parameter.create(name=f"Modèle : {model.name}", type="group", children=[
+            dict(name="Modèle de référence", type="bool",
+                 value=component.is_reference(capture, model),
+                 tip="Modèle proposé par défaut quand le composant est réutilisé"),
             dict(name="Réglages", type="group", children=[
                 dict(name="Type", type="list", limits=list(fit.KINDS), value=model.kind),
                 dict(name="Fréquence min", value=model.f_min, limits=limits, **FREQ),
@@ -451,7 +766,15 @@ class MainController(QtCore.QObject):
         ])
         self._model_group = param.child("Réglages")
         self._model_group.sigTreeStateChanged.connect(
-            lambda *_: self._on_model_settings_changed(capture, model))
+            lambda *_: self._on_model_settings_changed(component, capture, model))
+
+        def on_reference(_, checked):
+            component.reference = (capture.id, model.id) if checked else None
+            self._save(component)
+            # différé : la reconstruction remplace l'arbre de paramètres en cours d'édition
+            QtCore.QTimer.singleShot(0, lambda: self._rebuild(keep_selection=True))
+
+        param.child("Modèle de référence").sigValueChanged.connect(on_reference)
         return param
 
     @staticmethod
@@ -473,18 +796,22 @@ class MainController(QtCore.QObject):
                 " (hors de la plage du fit : ESL peu fiable)"
             children.append(dict(name="Résonance série", type="str", readonly=True,
                                  value=pg.siFormat(f_res, precision=4, suffix="Hz") + note))
+        if model.date:
+            children.append(dict(name="Ajusté le", type="str", readonly=True,
+                                 value=f"{model.date.replace('T', ' ')} (v{model.version})"))
         return children
 
-    def _on_model_settings_changed(self, capture: Capture, model: ModelFit):
+    def _on_model_settings_changed(self, component, capture, model):
         if self._updating_model:            # changement fait ci-dessous, pas par l'utilisateur
             return
         self._updating_model = True
         try:
-            self._apply_model_settings(capture, model)
+            self._apply_model_settings(component, capture, model)
         finally:
             self._updating_model = False
 
-    def _apply_model_settings(self, capture: Capture, model: ModelFit):
+    def _apply_model_settings(self, component: Component, capture: Capture,
+                              model: ModelFit):
         g = self._model_group
         f_min, f_max = sorted((float(g["Fréquence min"]), float(g["Fréquence max"])))
         kind_changed = g["Type"] != model.kind
@@ -508,8 +835,10 @@ class MainController(QtCore.QObject):
         result = self._selection_param.child("Résultat")
         result.clearChildren()
         result.addChildren(self._result_children(model))
-        self.library.save(capture)
+        self._save(component)
         self._refresh_graph()
+        if self.filter_ctrl is not None:
+            self.filter_ctrl.refresh_sources()
 
     def _run_fit(self, capture: Capture, model: ModelFit) -> bool:
         try:
@@ -523,10 +852,10 @@ class MainController(QtCore.QObject):
 
     # ------------------------------------------------------------------ actions
     def add_model(self):
-        """Nouveau modèle sur la capture sélectionnée, ajusté sur toute sa bande."""
-        capture, _ = self.selected()
+        """Nouveau modèle sur la mesure sélectionnée, ajusté sur toute sa bande."""
+        component, capture = self.selected_capture()
         if capture is None:
-            self._error("Sélectionnez d'abord une capture.")
+            self._error("Sélectionnez d'abord une mesure.")
             return
         if fit.is_capacitive(capture.f, capture.z):
             # condensateur : résistance de fuite décochée par défaut
@@ -544,82 +873,194 @@ class MainController(QtCore.QObject):
         model.name = f"{model.kind} {n}"
         self._run_fit(capture, model)
         capture.models.append(model)
-        self.library.save(capture)
-        self._rebuild_tree(select=("model", capture.id, model.id))
+        self._save(component)
+        self._rebuild(select=("model", component.id, capture.id, model.id))
+
+    def add_to_library(self):
+        """
+        Range le composant de la session sélectionné dans la librairie, après saisie de
+        sa fiche : comme nouveau composant, ou comme mesure d'un composant existant.
+        """
+        component, capture, _ = self.selected()
+        if component is None or self.in_library(component):
+            self._error("Sélectionnez d'abord une mesure de la session.")
+            return
+        answer = self._ask_component(component, targets=list(self.library.components))
+        if answer is None:
+            return
+        values, target = answer
+        was_draft = self.drafts.contains(component)
+        source_path = component.path
+        try:
+            if target is None:
+                for key, value in values.items():
+                    setattr(component, key, value)
+                self.library.add(component)
+                destination = component
+            else:
+                target.captures.extend(component.captures)
+                lib.save_component(target)
+                destination = target
+        except LibraryError as error:
+            component.path = source_path        # rien n'a bougé : le brouillon reste
+            if target is not None:
+                del target.captures[-len(component.captures):]
+            self._error(str(error))
+            return
+        # le brouillon a rejoint la librairie : son fichier n'a plus lieu d'être
+        # (un fichier ouvert à la main, lui, est laissé à sa place)
+        if was_draft:
+            self.drafts.discard(component, source_path)
+        self.session = [c for c in self.session if c is not component]
+        shown = capture or destination.captures[-1]
+        shown.visible = True
+        self.clear_filters()
+        self._rebuild(select=("capture", destination.id, shown.id, None))
+        self._status(f"« {destination.name} » : ajouté à la librairie.")
+
+    def edit_component(self):
+        """Modifie la fiche du composant sélectionné."""
+        component, _, _ = self.selected()
+        if component is None:
+            return
+        answer = self._ask_component(component)
+        if answer is None:
+            return
+        values, _ = answer
+        for key, value in values.items():
+            setattr(component, key, value)
+        # brouillon à une seule mesure : la mesure suit le nom du composant
+        if not self.in_library(component) and len(component.captures) == 1:
+            component.captures[0].name = component.name
+        self._save(component)
+        self._rebuild(keep_selection=True)
 
     def delete_selected(self):
-        capture, model = self.selected()
-        if capture is None:
+        component, capture, model = self.selected()
+        if component is None:
             return
         if model is not None:
             if not self._confirm(f"Supprimer le modèle « {model.name} » ?"):
                 return
             capture.models.remove(model)
-            self.library.save(capture)
-            self._rebuild_tree(select=("capture", capture.id, None))
+            if component.reference and component.reference[1] == model.id:
+                component.reference = None
+            self._save(component)
+            self._rebuild(select=("capture", component.id, capture.id, None))
             return
-        if not self._confirm(f"Supprimer la capture « {capture.name} » et ses modèles ?\n"
-                             "Son fichier est supprimé de la librairie."):
+        if capture is not None and len(component.captures) > 1:
+            if not self._confirm(f"Supprimer la mesure « {capture.name} » et ses modèles ?"):
+                return
+            component.captures.remove(capture)
+            if component.reference and component.reference[0] == capture.id:
+                component.reference = None
+            self._save(component)
+            self._rebuild(select=("component", component.id, None, None))
             return
-        self.library.remove(capture)
-        self._rebuild_tree()
+        self._delete_component(component)
+
+    def _delete_component(self, component: Component):
+        stored = self.library if self.in_library(component) else \
+            self.drafts if self.drafts.contains(component) else None
+        if stored is None:
+            # fichier ouvert à la main : retiré de la session, son fichier reste en place
+            self.session = [c for c in self.session if c is not component]
+            self._rebuild()
+            return
+        where = "de la librairie" if stored is self.library else "des brouillons"
+        if not self._confirm(f"Supprimer « {component.name} », ses mesures et ses modèles ?\n"
+                             f"Son fichier est supprimé {where}."):
+            return
+        try:
+            stored.remove(component)
+        except LibraryError as error:
+            self._error(str(error))
+            return
+        self.session = [c for c in self.session if c is not component]
+        self._rebuild()
 
     def export_subckt(self):
-        capture, model = self.selected()
+        """Modèle sélectionné, ou modèle de référence du composant sélectionné."""
+        component, capture, model = self.selected()
+        if component is not None and model is None:
+            found = component.reference_model() if capture is None else None
+            if found is not None:
+                capture, model = found
         if model is None or not model.fitted:
             self._error("Sélectionnez d'abord un modèle ajusté.")
             return
-        name = spice.subckt_name(f"{capture.name}_{model.name}")
+        name = spice.subckt_name(f"{component.name}_{model.name}")
         path = self._ask_save_path("Exporter le modèle", f"{name}.lib",
                                    "Librairie SPICE (*.lib *.sub *.cir)")
         if not path:
             return
-        comment = (f"{model.kind}, {capture.name}, {model.f_min:g} Hz - {model.f_max:g} Hz, "
+        details = ", ".join(v for v in (component.manufacturer, component.part_number,
+                                        component.fay_code) if v)
+        comment = (f"{model.kind}, {component.name}" + (f" ({details})" if details else "")
+                   + f", mesure {capture.name} du {capture.date[:10]}, "
+                   f"{model.f_min:g} Hz - {model.f_max:g} Hz, "
                    f"erreur relative moyenne {100 * model.rel_err:.3f} %")
         text = spice.subckt(name, model.kind, model.params, model.nr, model.nc, comment)
         pathlib.Path(path).write_text(text, encoding="utf-8")
         self._status(f"Modèle exporté : {path}")
 
     def export_csv(self):
-        capture, _ = self.selected()
+        _, capture = self.selected_capture()
         if capture is None:
-            self._error("Sélectionnez d'abord une capture.")
+            self._error("Sélectionnez d'abord une mesure.")
             return
-        path = self._ask_save_path("Exporter la capture",
+        path = self._ask_save_path("Exporter la mesure",
                                    f"{spice.subckt_name(capture.name)}.csv", "CSV (*.csv)")
         if not path:
             return
         capture.to_csv(path)
-        self._status(f"Capture exportée : {path}")
+        self._status(f"Mesure exportée : {path}")
 
     # ------------------------------------------------------------------ menu Fichier
     def open_files(self):
-        """Ouvre des captures (.json), y compris situées hors de la librairie."""
-        paths = self._ask_open_paths("Ouvrir une capture", "Capture RLCmeter (*.json)")
+        """Ouvre des fichiers de composant (.json) situés hors des répertoires scrutés."""
+        paths = self._ask_open_paths("Ouvrir un composant", "Composant RLCmeter (*.json)")
         last, errors = None, []
         for path in paths:
-            try:
-                last = self.library.open_file(path)
-            except LibraryError as error:
-                errors.append(str(error))
+            target = pathlib.Path(path).resolve()
+            known = next((c for c in self.all_components() + self.drafts.components
+                          if c.path and pathlib.Path(c.path).resolve() == target), None)
+            if known is None:
+                try:
+                    known = lib.read_component(target)
+                except LibraryError as error:
+                    errors.append(str(error))
+                    continue
+                known = self.find_component(known.id) or known
+            if not self.in_library(known) and not any(c is known for c in self.session):
+                self.session.append(known)
+            last = known
         if last is not None:
-            self._rebuild_tree(select=("capture", last.id, None))
+            capture = last.captures[0] if last.captures else None
+            if capture is not None:
+                capture.visible = True
+            self._rebuild(select=("capture", last.id, capture.id, None) if capture
+                          else ("component", last.id, None, None))
         if errors:
             self._error("\n".join(errors))
 
-    def save_capture_as(self):
-        """Copie la capture sélectionnée (avec ses modèles) dans un fichier choisi."""
-        capture, _ = self.selected()
-        if capture is None:
-            self._error("Sélectionnez d'abord une capture.")
+    def save_component_as(self):
+        """Copie le composant sélectionné (mesures et modèles compris) dans un fichier."""
+        component, _, _ = self.selected()
+        if component is None:
+            self._error("Sélectionnez d'abord un composant ou une mesure.")
             return
-        path = self._ask_save_path("Sauvegarder la capture sous",
-                                   f"{spice.subckt_name(capture.name)}.json",
-                                   "Capture RLCmeter (*.json)")
+        path = self._ask_save_path("Sauvegarder le composant sous",
+                                   f"{spice.subckt_name(component.name)}.json",
+                                   "Composant RLCmeter (*.json)")
         if not path:
             return
-        self.library.save_copy(capture, path)
-        self._status(f"Capture copiée : {path}")
+        try:
+            lib.save_copy(component, path)
+        except LibraryError as error:
+            self._error(str(error))
+            return
+        self._status(f"Composant copié : {path}")
 
     # ------------------------------------------------------------------ menu Utilitaires
     def open_options(self):
@@ -631,26 +1072,26 @@ class MainController(QtCore.QObject):
         return dialog
 
     def apply_options(self, options: dict):
-        """Nouvelles options ; un changement de répertoire recharge la librairie."""
+        """Nouvelles options ; un changement de répertoire relit librairie et brouillons."""
         options = dict(options)
-        if not str(options.get("library_dir") or "").strip():
-            options["library_dir"] = self.options["library_dir"]
-        changed = pathlib.Path(options["library_dir"]) != self.library.folder
+        for key in ("library_dir", "drafts_dir"):
+            if not str(options.get(key) or "").strip():
+                options[key] = self.options[key]
+        changed = (pathlib.Path(options["library_dir"]) != self.library.folder
+                   or pathlib.Path(options["drafts_dir"]) != self.drafts.folder)
         self.options.update(options)
         self._save_settings()
         if changed:
-            self.library = Library(self.options["library_dir"])
-            self.library.load()
-            if self.filter_ctrl is not None:
-                self.filter_ctrl.library = self.library
-            self._rebuild_tree()
+            self._load_folders()
+            self._rebuild()
+            self._report_load_errors()
             self._status(f"Librairie : {self.library.folder} "
-                         f"({len(self.library.captures)} capture(s))")
+                         f"({len(self.library.components)} composant(s))")
 
     def open_filter(self):
         if self.filter_ctrl is None:
             from controller.filter_controller import FilterController
-            self.filter_ctrl = FilterController(self.library, self.view)
+            self.filter_ctrl = FilterController(self.all_components, self.view)
         self.filter_ctrl.show()
 
     # ------------------------------------------------------------------ menu Aide
@@ -667,9 +1108,9 @@ class MainController(QtCore.QObject):
     def show_about(self):
         QtWidgets.QMessageBox.about(
             self.view, "À propos de RLCmeter",
-            "<b>RLCmeter</b><br>Mesure d'impédance avec un HP 4194A (GPIB), modélisation "
-            "Foster / Cauer et estimation de filtres.<br><br>"
-            f"Librairie : {self.library.folder}")
+            f"<b>RLCmeter {VERSION}</b><br>Mesure d'impédance avec un HP 4194A (GPIB), "
+            "modélisation d'inductances et de condensateurs, estimation de filtres.<br><br>"
+            f"Librairie : {self.library.folder}<br>Brouillons : {self.drafts.folder}")
 
     # ------------------------------------------------------------------ graphes
     def _refresh_graph(self, *_):
@@ -677,7 +1118,7 @@ class MainController(QtCore.QObject):
         mode = v.displayCombo.currentText()
         if mode not in DISPLAY_MODES:
             return
-        selected_capture, selected_model = self.selected()
+        sel_component, sel_capture, sel_model = self.selected()
         plots = (v.plot_top, v.plot_bottom)
         for plot, quantity in zip(plots, DISPLAY_MODES[mode]):
             plot.clear()
@@ -686,36 +1127,43 @@ class MainController(QtCore.QObject):
             plot.getAxis("left").enableAutoSIPrefix(not quantity.log)
             plot.setLabel("left", quantity.name, units=quantity.unit)
 
-        for capture in self.library.captures:
-            color = QtGui.QColor(capture.color)
-            if capture.visible:
-                width = 3 if capture is selected_capture else 2
+        for component in self.all_components():
+            many = len(component.captures) > 1 or component.name != component.captures[0].name \
+                if component.captures else False
+            for capture in component.captures:
+                # tracées : les mesures cochées, celle sélectionnée, et toutes celles du
+                # composant sélectionné
+                selected = capture is sel_capture or (component is sel_component
+                                                      and sel_capture is None)
+                if not (capture.visible or selected):
+                    continue
+                label = f"{component.name} / {capture.name}" if many else capture.name
+                color = QtGui.QColor(capture.color)
+                width = 3 if capture is sel_capture else 2
                 for plot, quantity in zip(plots, DISPLAY_MODES[mode]):
                     plot.plot(capture.f, self._plottable(capture.quantity(quantity), quantity),
                               pen=pg.mkPen(color, width=width), connect="finite",
-                              name=capture.name if plot is v.plot_top else None)
-            for model in capture.models:
-                if not (model.visible and model.fitted):
-                    continue
-                band = (capture.f >= model.f_min) & (capture.f <= model.f_max)
-                f = capture.f[band]
-                if f.size == 0:
-                    continue
-                z = fit.impedance(model.kind, f, model.params, model.nr, model.nc)
-                pen = pg.mkPen(color.lighter(150) if theme.colors() is theme.DARK
-                               else color.darker(140),
-                               width=2,
-                               style=QtCore.Qt.PenStyle.DashLine)
-                for plot, quantity in zip(plots, DISPLAY_MODES[mode]):
-                    plot.plot(f, self._plottable(quantity.compute(f, z), quantity), pen=pen,
-                              connect="finite",
-                              name=f"{capture.name} / {model.name}"
-                                   if plot is v.plot_top else None)
+                              name=label if plot is v.plot_top else None)
+                for model in capture.models:
+                    if not (model.fitted and (model.visible or model is sel_model)):
+                        continue
+                    band = (capture.f >= model.f_min) & (capture.f <= model.f_max)
+                    f = capture.f[band]
+                    if f.size == 0:
+                        continue
+                    z = fit.impedance(model.kind, f, model.params, model.nr, model.nc)
+                    pen = pg.mkPen(color.lighter(150) if theme.colors() is theme.DARK
+                                   else color.darker(140),
+                                   width=2, style=QtCore.Qt.PenStyle.DashLine)
+                    for plot, quantity in zip(plots, DISPLAY_MODES[mode]):
+                        plot.plot(f, self._plottable(quantity.compute(f, z), quantity),
+                                  pen=pen, connect="finite",
+                                  name=f"{label} / {model.name}"
+                                       if plot is v.plot_top else None)
 
-        if selected_model is not None:
+        if sel_model is not None:
             self.region.blockSignals(True)
-            self.region.setRegion((np.log10(selected_model.f_min),
-                                   np.log10(selected_model.f_max)))
+            self.region.setRegion((np.log10(sel_model.f_min), np.log10(sel_model.f_max)))
             self.region.blockSignals(False)
             v.plot_top.addItem(self.region, ignoreBounds=True)
 
@@ -741,6 +1189,7 @@ class MainController(QtCore.QObject):
 
     # ------------------------------------------------------------------ fermeture
     def _on_closing(self):
+        self._closed = True
         if self._worker is not None:
             self._worker.cancel()
             self._worker.wait(5000)

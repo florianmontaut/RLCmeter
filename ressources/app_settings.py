@@ -3,16 +3,23 @@
 from model import fit
 
 
-def schema(default_library: str) -> dict:
+def schema(default_library: str, default_drafts: str) -> dict:
     return {
         "Modèles": {
             "type": "group",
             "children": {
-                "Répertoire des mesures et modèles": {
+                "Répertoire de la librairie": {
                     "type": "file",
                     "fileMode": "Directory",
                     "default": default_library,
                     "key": "library_dir",
+                },
+                # chaque nouvelle mesure y est enregistrée, avant son ajout à la librairie
+                "Répertoire des brouillons": {
+                    "type": "file",
+                    "fileMode": "Directory",
+                    "default": default_drafts,
+                    "key": "drafts_dir",
                 },
                 "Nouveau modèle": {
                     "type": "group",

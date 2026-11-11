@@ -1,64 +1,75 @@
-"""Parcours de l'interface sans écran, avec l'instrument simulé."""
+"""Parcours de l'interface sans écran : mesure, session, fit, affichage, exports."""
 import numpy as np
 import pytest
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore
 
+from helpers import (dispose, curves, find_item, library_names, make_controller, measure,
+                     session_labels)
 from controller.main_controller import MainController
-from instrument.hp4194a import SimulatedInstrument
+from instrument import hp4194a
+from model import fit
+from model import library as lib
 from view.main_window import MainWindow
 
-
-@pytest.fixture(scope="session")
-def app():
-    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+UNCHECKED = QtCore.Qt.CheckState.Unchecked
 
 
 @pytest.fixture
-def ctrl(app, tmp_path, monkeypatch):
-    monkeypatch.setattr(SimulatedInstrument, "MAX_DURATION", 0.0)
-    window = MainWindow()
-    controller = MainController(window, tmp_path / "library", tmp_path / "settings.json")
-    controller.errors = []
-    monkeypatch.setattr(controller, "_error", controller.errors.append)
-    monkeypatch.setattr(controller, "_confirm", lambda text: True)
-    controller.acq.child("Fréquence stop").setValue(30e6)
-    controller.acq.child("Points").setValue(200)
+def ctrl(tmp_path, monkeypatch):
+    controller = make_controller(tmp_path, monkeypatch)
     yield controller
-    window.close()
+    dispose(controller)
 
 
-def measure(ctrl):
-    ctrl.toggle_measure()
-    loop = QtCore.QEventLoop()
-    ctrl._worker.finished.connect(loop.quit)
-    QtCore.QTimer.singleShot(10000, loop.quit)
-    loop.exec()
-    QtWidgets.QApplication.processEvents()
-
-
-def curves(plot):
-    return [item for item in plot.listDataItems()]
-
-
-def test_measure_creates_a_capture_and_plots_it(ctrl, tmp_path):
+# --------------------------------------------------------------------------- mesure
+def test_measure_goes_to_the_session_and_is_saved_as_a_draft(ctrl, tmp_path):
     measure(ctrl)
-    assert ctrl.errors == []
-    assert not ctrl.measuring
-    assert len(ctrl.library.captures) == 1
-    capture, model = ctrl.selected()
-    assert capture.name == "mesure" and model is None and capture.f.size == 200
-    assert len(list((tmp_path / "library").glob("*.json"))) == 1
+    assert ctrl.errors == [] and not ctrl.measuring
+    component, capture, model = ctrl.selected()
+    assert capture.name == "mesure" and component.name == "mesure" and model is None
+    assert capture.f.size == 200
+    assert session_labels(ctrl) == ["mesure"] and library_names(ctrl) == []
+    # enregistrée aussitôt, hors de la librairie
+    assert len(list((tmp_path / "brouillons").glob("*.json"))) == 1
+    assert not list((tmp_path / "library").glob("*.json"))
     assert len(curves(ctrl.view.plot_top)) == 1 and len(curves(ctrl.view.plot_bottom)) == 1
     measure(ctrl)
-    assert [c.name for c in ctrl.library.captures] == ["mesure", "mesure (2)"]
+    assert session_labels(ctrl) == ["mesure", "mesure (2)"]
 
 
+def test_previous_drafts_are_kept_but_hidden_by_default(ctrl, tmp_path, monkeypatch):
+    measure(ctrl)
+    ctrl.view.close()
+    again = make_controller(tmp_path, monkeypatch)
+    assert session_labels(again) == []                  # nouvelle session : vide
+    assert len(again.drafts.components) == 1            # mais le brouillon est toujours là
+    again.view.actionShowDrafts.setChecked(True)
+    assert session_labels(again) == ["mesure"]
+    again.select(("capture", again.drafts.components[0].id,
+                  again.drafts.components[0].captures[0].id, None))
+    again.add_model()
+    assert again.selected()[2].fitted
+    again.view.actionShowDrafts.setChecked(False)
+    assert session_labels(again) == []
+
+
+def test_link_test_and_invalid_settings(ctrl):
+    ctrl.test_link()
+    assert ctrl.acq["Appareil"] == "HP 4194A simulé" and ctrl.errors == []
+    ctrl.acq.child("Fréquence start").setValue(20e6)
+    ctrl.acq.child("Fréquence stop").setValue(1e6)
+    ctrl.toggle_measure()
+    assert not ctrl.measuring and len(ctrl.errors) == 1
+
+
+# --------------------------------------------------------------------------- fit
 def test_fit_workflow(ctrl, tmp_path, monkeypatch):
     measure(ctrl)
     ctrl.add_model()
-    capture, model = ctrl.selected()
+    component, capture, model = ctrl.selected()
     assert model is not None and model.fitted and model.name == "Foster 1"
     assert model.rel_err < 0.02
+    assert session_labels(ctrl) == ["mesure", "  Foster 1"]
     # courbe mesurée + courbe du modèle, et plage du fit sur le graphe du haut
     assert len(curves(ctrl.view.plot_top)) == 2
     assert ctrl.region in ctrl.view.plot_top.items
@@ -71,7 +82,7 @@ def test_fit_workflow(ctrl, tmp_path, monkeypatch):
     assert (model.auto_order, model.nr, model.nc) == (False, 1, 0)
     assert len(model.params) == 4
     names = [p.name() for p in ctrl._selection_param.child("Résultat").children()]
-    assert names[-4:] == ["R0", "L0", "R1", "L1"]
+    assert names[2:6] == ["R0", "L0", "R1", "L1"] and names[-1] == "Ajusté le"
 
     group.child("Type").setValue("Cauer")
     assert model.kind == "Cauer" and model.fitted
@@ -87,11 +98,53 @@ def test_fit_workflow(ctrl, tmp_path, monkeypatch):
     ctrl.export_subckt()
     assert target.read_text(encoding="utf-8").count(".subckt") == 1
 
-    # le modèle est enregistré avec la capture
-    other = MainController(MainWindow(), tmp_path / "library")
-    assert other.library.captures[0].models[0].kind == "Cauer"
+    # le modèle est enregistré avec sa mesure, dans le brouillon
+    saved = lib.read_component(component.path)
+    assert saved.captures[0].models[0].kind == "Cauer"
 
 
+def test_capacitor_workflow(ctrl, tmp_path, monkeypatch):
+    ctrl.acq.child("Fréquence stop").setValue(40e6)
+    # une mesure capacitive reçoit d'office le modèle « Condensateur », sans fuite
+    measure(ctrl, hp4194a.LINK_SIMULATION_CAPACITOR)
+    ctrl.add_model()
+    component, capture, model = ctrl.selected()
+    assert (model.kind, model.name, model.parallel_cap) == (fit.CAPACITOR, "Condensateur 1",
+                                                            False)
+    assert model.fitted and model.nr == 1 and model.rel_err < 0.01
+
+    group = ctrl._model_group
+    assert group.child("Ordre").opts["title"] == "Branches R-C"
+    assert group.child("Ordre").opts["limits"] == (0, 2)
+    assert group.child("Branche parallèle").opts["title"] == "Résistance de fuite"
+    names = [p.name() for p in ctrl._selection_param.child("Résultat").children()]
+    assert names[2:8] == ["ESR", "ESL", "C0", "R1", "C1", "Résonance série"]
+
+    group.child("Ordre automatique").setValue(False)
+    group.child("Ordre").setValue(0)
+    assert model.nr == 0 and len(model.params) == 3
+    group.child("Fréquence max").setValue(10e3)
+    assert "ESL peu fiable" in ctrl._selection_param.child("Résultat",
+                                                           "Résonance série").value()
+
+    # passage à un modèle d'inductance : libellés, limites et ordre suivent
+    group.child("Type").setValue("Foster")
+    assert model.kind == "Foster" and model.nr == 1
+    assert group.child("Ordre").opts["title"] == "Cellules R-L"
+    assert group.child("Ordre").opts["limits"] == (1, 3)
+    group.child("Type").setValue(fit.CAPACITOR)
+
+    target = tmp_path / "c.lib"
+    monkeypatch.setattr(ctrl, "_ask_save_path", lambda *a: str(target))
+    ctrl.export_subckt()
+    assert "Lesl a b" in target.read_text(encoding="utf-8")
+
+    measure(ctrl, hp4194a.LINK_SIMULATION)
+    ctrl.add_model()
+    assert ctrl.selected()[2].kind == "Foster" and ctrl.errors == []
+
+
+# --------------------------------------------------------------------------- affichage
 def test_display_modes_and_visibility(ctrl):
     measure(ctrl)
     for mode in ("|Z|-Theta", "Cs-Rs", "Ls-Rs"):
@@ -99,18 +152,27 @@ def test_display_modes_and_visibility(ctrl):
         assert len(curves(ctrl.view.plot_top)) == 1
         x, y = curves(ctrl.view.plot_top)[0].getData()
         assert np.isfinite(y).any()
-    item = ctrl.tree_model.item(0)
-    item.setCheckState(QtCore.Qt.CheckState.Unchecked)
-    assert not ctrl.library.captures[0].visible
-    assert curves(ctrl.view.plot_top) == []
+    measure(ctrl)                               # deuxième mesure, sélectionnée
+    assert len(curves(ctrl.view.plot_top)) == 2
+    component = ctrl.session[0]
+    item = find_item(ctrl, ("capture", component.id, component.captures[0].id, None))
+    item.setCheckState(UNCHECKED)
+    assert not component.captures[0].visible
+    assert len(curves(ctrl.view.plot_top)) == 1
+    # la mesure sélectionnée reste tracée même décochée
+    second = ctrl.session[1]
+    find_item(ctrl, ("capture", second.id, second.captures[0].id, None)).setCheckState(
+        UNCHECKED)
+    assert len(curves(ctrl.view.plot_top)) == 1
 
 
 def test_rename_export_and_delete(ctrl, tmp_path, monkeypatch):
     measure(ctrl)
-    ctrl.tree_model.item(0).setText("bobine A")
-    capture = ctrl.library.captures[0]
-    assert capture.name == "bobine A"
-    assert [p.name for p in (tmp_path / "library").glob("*.json")][0].startswith("bobine_A")
+    ctrl.session_model.item(0).setText("bobine A")
+    component, capture, _ = ctrl.selected()
+    assert capture.name == "bobine A" and component.name == "bobine A"
+    names = [p.name for p in (tmp_path / "brouillons").glob("*.json")]
+    assert len(names) == 1 and names[0].startswith("bobine_A")
 
     target = tmp_path / "capture.csv"
     monkeypatch.setattr(ctrl, "_ask_save_path", lambda *a: str(target))
@@ -119,18 +181,10 @@ def test_rename_export_and_delete(ctrl, tmp_path, monkeypatch):
 
     ctrl.add_model()
     ctrl.delete_selected()                      # le modèle
-    assert capture.models == [] and ctrl.selected() == (capture, None)
-    ctrl.delete_selected()                      # la capture
-    assert ctrl.library.captures == [] and not list((tmp_path / "library").glob("*.json"))
-
-
-def test_link_test_and_invalid_settings(ctrl):
-    ctrl.test_link()
-    assert ctrl.acq["Appareil"] == "HP 4194A simulé" and ctrl.errors == []
-    ctrl.acq.child("Fréquence start").setValue(20e6)
-    ctrl.acq.child("Fréquence stop").setValue(1e6)
-    ctrl.toggle_measure()
-    assert not ctrl.measuring and len(ctrl.errors) == 1
+    assert capture.models == [] and ctrl.selected() == (component, capture, None)
+    ctrl.delete_selected()                      # la mesure, donc le brouillon entier
+    assert ctrl.session == [] and session_labels(ctrl) == []
+    assert not list((tmp_path / "brouillons").glob("*.json"))
 
 
 def test_settings_are_restored(ctrl, tmp_path):

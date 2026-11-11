@@ -5,7 +5,6 @@ from instrument import hp4194a
 from instrument.hp4194a import SimulatedInstrument, SweepSettings
 from model import fit, spice
 from model.capture import ABS_Z, CS, LS, RS, THETA, Capture, ModelFit
-from model.library import Library
 
 F = np.geomspace(100, 3e6, 200)
 
@@ -106,43 +105,6 @@ def test_subckt_cauer_ladder():
     lines = spice.subckt("m", "Cauer", [0.1, 1e-5, 3, 2e-6, 5, 1e-6], 2, 0).splitlines()
     assert "L1 n1 2 2e-06 Rser=0" in lines and "R1 n1 n2 3" in lines
     assert "L2 n2 2 1e-06 Rser=0" in lines and "R2 n2 2 5" in lines
-
-
-# --------------------------------------------------------------------------- librairie
-def test_library_round_trip(tmp_path):
-    library = Library(tmp_path)
-    library.load()
-    capture = Capture("essai 1", F, fit.impedance("Foster", F, [0.05, 8e-6, 2.0, 1e-6], 1, 0),
-                      settings={"points": 200})
-    capture.models.append(ModelFit(kind="Cauer", nr=2, params=[1.0, 2.0], name="m1"))
-    library.add(capture)
-
-    reloaded = Library(tmp_path)
-    reloaded.load()
-    assert len(reloaded.captures) == 1
-    copy = reloaded.captures[0]
-    assert copy.name == "essai 1" and copy.id == capture.id
-    assert copy.z == pytest.approx(capture.z)
-    assert copy.models[0].kind == "Cauer" and copy.models[0].params == [1.0, 2.0]
-
-
-def test_library_rename_and_remove(tmp_path):
-    library = Library(tmp_path)
-    capture = Capture("a", [1.0, 2.0], [1j, 2j])
-    library.add(capture)
-    capture.name = "b"
-    library.save(capture)
-    assert len(list(tmp_path.glob("*.json"))) == 1          # ancien fichier retiré
-    assert library.unique_name("b") == "b (2)"
-    library.remove(capture)
-    assert not list(tmp_path.glob("*.json")) and not library.captures
-
-
-def test_library_reports_unreadable_files(tmp_path):
-    (tmp_path / "bad.json").write_text("{", encoding="utf-8")
-    library = Library(tmp_path)
-    library.load()
-    assert library.captures == [] and library.errors[0][0] == "bad.json"
 
 
 # --------------------------------------------------------------------------- instrument

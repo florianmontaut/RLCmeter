@@ -5,3 +5,6 @@ __pycache__/
 
 # réglages locaux de l'application (liaison, adresse GPIB, thème)
 settings.json
+
+# mesures en attente d'ajout à la librairie
+brouillons/

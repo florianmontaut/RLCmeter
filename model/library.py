@@ -1,8 +1,11 @@
 # model/library.py
 """
-Librairie des captures : un répertoire et ses sous-répertoires, un fichier .json par
-capture (avec ses modèles). Des captures situées ailleurs peuvent aussi être ouvertes
-(Fichier > Ouvrir) : elles restent enregistrées dans leur propre fichier.
+Répertoire de composants : un fichier .json par composant (model/component.py), lus dans
+le répertoire et ses sous-répertoires. Deux répertoires sont utilisés :
+
+    - la librairie : les composants caractérisés, avec leur fiche ;
+    - les brouillons : chaque nouvelle mesure y est enregistrée aussitôt, pour ne jamais
+      la perdre, en attendant d'être ajoutée à la librairie.
 """
 from __future__ import annotations
 
@@ -10,9 +13,8 @@ import json
 import pathlib
 import re
 
-from model.capture import Capture
+from model.component import Component
 
-FORMAT_PREFIX = "RLCmeter capture"
 IGNORED_FOLDERS = {"__pycache__"}
 
 
@@ -20,41 +22,71 @@ class LibraryError(Exception):
     pass
 
 
-def read_capture(path) -> Capture:
-    """Capture d'un fichier .json ; LibraryError si ce n'en est pas une."""
+def read_component(path) -> Component:
+    """Composant d'un fichier .json ; LibraryError si ce n'en est pas un."""
     path = pathlib.Path(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise LibraryError(f"{path.name} : fichier illisible ({error})") from error
-    if not isinstance(data, dict) or not str(data.get("format", "")).startswith(FORMAT_PREFIX):
-        raise LibraryError(f"{path.name} : ce n'est pas une capture RLCmeter")
     try:
-        capture = Capture.from_dict(data)
+        component = Component.from_dict(data)
     except (ValueError, KeyError, TypeError) as error:
-        raise LibraryError(f"{path.name} : capture invalide ({error})") from error
-    capture.path = str(path)
-    return capture
+        raise LibraryError(f"{path.name} : {error}") from error
+    component.path = str(path)
+    return component
 
 
-def file_name(capture: Capture) -> str:
-    slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", capture.name).strip("_") or "capture"
-    return f"{slug}_{capture.id[:8]}.json"
+def file_name(component: Component) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_\-]+", "_", component.name).strip("_") or "composant"
+    return f"{slug}_{component.id[:8]}.json"
+
+
+def save_component(component: Component, folder=None) -> None:
+    """
+    Enregistre le composant dans son répertoire (ou folder s'il n'a pas encore de
+    fichier) ; son fichier suit son nom. LibraryError si l'écriture est impossible
+    (répertoire en lecture seule...).
+    """
+    target = pathlib.Path(component.path).parent if component.path else pathlib.Path(folder)
+    path = target / file_name(component)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(component.to_dict(), indent=1), encoding="utf-8")
+        if component.path and pathlib.Path(component.path) != path:
+            pathlib.Path(component.path).unlink(missing_ok=True)
+    except OSError as error:
+        raise LibraryError(f"Enregistrement impossible dans {target} : {error}") from error
+    component.path = str(path)
+
+
+def save_copy(component: Component, path) -> None:
+    """Copie du composant (mesures et modèles compris) dans un autre fichier."""
+    try:
+        pathlib.Path(path).write_text(json.dumps(component.to_dict(), indent=1),
+                                      encoding="utf-8")
+    except OSError as error:
+        raise LibraryError(f"Enregistrement impossible : {error}") from error
 
 
 class Library:
 
     def __init__(self, folder):
         self.folder = pathlib.Path(folder)
-        self.captures: list[Capture] = []
+        self.components: list[Component] = []
         # fichiers illisibles au chargement : (nom du fichier, erreur)
         self.errors: list[tuple[str, str]] = []
 
     # ------------------------------------------------------------------ lecture
     def load(self) -> None:
-        """Lit toutes les captures du répertoire et de ses sous-répertoires."""
-        self.folder.mkdir(parents=True, exist_ok=True)
-        self.captures, self.errors = [], []
+        """Lit tous les composants du répertoire et de ses sous-répertoires."""
+        self.components, self.errors = [], []
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass                            # répertoire en lecture seule ou absent
+        if not self.folder.is_dir():
+            return
         for path in sorted(self.folder.rglob("*.json")):
             if self._ignored(path.parent):
                 continue
@@ -63,70 +95,37 @@ class Library:
             except (OSError, ValueError) as error:
                 self.errors.append((path.name, str(error)))
                 continue
-            if not isinstance(data, dict) or not str(data.get("format", "")).startswith(
-                    FORMAT_PREFIX):
-                continue                    # autre fichier .json : pas une capture
+            if not isinstance(data, dict) or "RLCmeter" not in str(data.get("format", "")):
+                continue                    # autre fichier .json : pas un composant
             try:
-                capture = Capture.from_dict(data)
+                component = Component.from_dict(data)
             except (ValueError, KeyError, TypeError) as error:
                 self.errors.append((path.name, str(error)))
                 continue
-            capture.path = str(path)
-            self.captures.append(capture)
-        self.captures.sort(key=lambda c: c.date)
+            component.path = str(path)
+            self.components.append(component)
+        self.components.sort(key=lambda c: c.created)
 
     def _ignored(self, folder: pathlib.Path) -> bool:
         parts = folder.relative_to(self.folder).parts
         return any(p.startswith(".") or p in IGNORED_FOLDERS for p in parts)
 
-    def subfolders(self) -> list[str]:
-        """Sous-répertoires de la librairie (chemins relatifs « a/b »), vides compris."""
-        if not self.folder.is_dir():
-            return []
-        return sorted(p.relative_to(self.folder).as_posix()
-                      for p in self.folder.rglob("*") if p.is_dir() and not self._ignored(p))
-
-    def relative_folder(self, capture: Capture) -> str | None:
-        """
-        Sous-répertoire de la capture dans la librairie (« » à la racine) ; None pour une
-        capture ouverte en dehors de la librairie.
-        """
-        if not capture.path:
-            return ""
-        try:
-            relative = pathlib.Path(capture.path).resolve().parent.relative_to(
-                                                                    self.folder.resolve())
-        except ValueError:
-            return None
-        return "" if relative.as_posix() == "." else relative.as_posix()
-
-    def open_file(self, path) -> Capture:
-        """
-        Ouvre un fichier de capture. S'il est déjà chargé (même fichier ou même capture),
-        la capture existante est renvoyée.
-        """
-        target = pathlib.Path(path).resolve()
-        for capture in self.captures:
-            if capture.path and pathlib.Path(capture.path).resolve() == target:
-                return capture
-        capture = read_capture(target)
-        existing = self.capture(capture.id)
-        if existing is not None:
-            return existing
-        self.captures.append(capture)
-        return capture
-
     # ------------------------------------------------------------------ accès
-    def capture(self, capture_id: str) -> Capture | None:
-        return next((c for c in self.captures if c.id == capture_id), None)
+    def component(self, component_id: str) -> Component | None:
+        return next((c for c in self.components if c.id == component_id), None)
 
-    def names(self) -> set[str]:
-        return {c.name for c in self.captures}
+    def contains(self, component: Component) -> bool:
+        return any(c is component for c in self.components)
+
+    def values(self, attribute: str) -> list[str]:
+        """Valeurs distinctes d'un champ de la fiche (propositions de saisie, filtres)."""
+        found = {str(getattr(c, attribute) or "").strip() for c in self.components}
+        return sorted(found - {""}, key=str.casefold)
 
     def unique_name(self, name: str) -> str:
-        """Nom libre dans la librairie : « nom », « nom (2) », « nom (3) »..."""
-        name = name.strip() or "capture"
-        used = self.names()
+        """Nom libre dans le répertoire : « nom », « nom (2) », « nom (3) »..."""
+        name = name.strip() or "mesure"
+        used = {c.name for c in self.components}
         if name not in used:
             return name
         n = 2
@@ -135,29 +134,29 @@ class Library:
         return f"{name} ({n})"
 
     # ------------------------------------------------------------------ écriture
-    def add(self, capture: Capture, subfolder: str = "") -> None:
-        """Nouvelle capture, enregistrée dans un sous-répertoire de la librairie."""
-        capture.path = str(self.folder / subfolder / file_name(capture))
-        self.captures.append(capture)
-        self.save(capture)
+    def add(self, component: Component, subfolder: str = "") -> None:
+        """Ajoute un composant et l'enregistre (dans un sous-répertoire au besoin)."""
+        component.path = None
+        save_component(component, self.folder / subfolder)
+        self.components.append(component)
 
-    def save(self, capture: Capture) -> None:
-        """Enregistre la capture dans son répertoire ; son fichier suit son nom."""
-        folder = pathlib.Path(capture.path).parent if capture.path else self.folder
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / file_name(capture)
-        path.write_text(json.dumps(capture.to_dict(), indent=1), encoding="utf-8")
-        if capture.path and pathlib.Path(capture.path) != path:
-            pathlib.Path(capture.path).unlink(missing_ok=True)
-        capture.path = str(path)
+    def discard(self, component: Component, path=None) -> None:
+        """
+        Oublie un composant parti dans un autre répertoire et supprime son ancien fichier
+        (path) ; un fichier impossible à supprimer est simplement laissé en place.
+        """
+        self.components = [c for c in self.components if c is not component]
+        if path:
+            try:
+                pathlib.Path(path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    @staticmethod
-    def save_copy(capture: Capture, path) -> None:
-        """Copie de la capture (et de ses modèles) dans un autre fichier."""
-        pathlib.Path(path).write_text(json.dumps(capture.to_dict(), indent=1),
-                                      encoding="utf-8")
-
-    def remove(self, capture: Capture) -> None:
-        if capture.path:
-            pathlib.Path(capture.path).unlink(missing_ok=True)
-        self.captures = [c for c in self.captures if c is not capture]
+    def remove(self, component: Component) -> None:
+        """Retire le composant et supprime son fichier."""
+        if component.path:
+            try:
+                pathlib.Path(component.path).unlink(missing_ok=True)
+            except OSError as error:
+                raise LibraryError(f"Suppression impossible : {error}") from error
+        self.components = [c for c in self.components if c is not component]

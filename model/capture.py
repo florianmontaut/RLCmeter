@@ -1,10 +1,14 @@
 # model/capture.py
 """
-Capture : un balayage en fréquence mesuré par l'analyseur, stocké en impédance complexe
-Z = R + jX. Les grandeurs affichées (Ls-Rs, |Z|-Theta, Cs-Rs) sont toutes déduites de Z
-(modèle série), donc une seule mesure suffit pour tous les affichages et pour les fits.
+Capture : une mesure, c'est-à-dire un balayage en fréquence de l'analyseur, stocké en
+impédance complexe Z = R + jX. Les grandeurs affichées (Ls-Rs, |Z|-Theta, Cs-Rs) sont
+toutes déduites de Z (modèle série), donc une seule mesure suffit pour tous les
+affichages et pour les fits.
 
-ModelFit : un modèle (Foster / Cauer) ajusté sur une capture, enregistré avec elle.
+ModelFit : un modèle ajusté sur une capture, enregistré avec elle (il ne quitte jamais
+les données brutes qui le justifient).
+
+Les captures sont regroupées par composant : voir model/component.py.
 """
 from __future__ import annotations
 
@@ -70,6 +74,9 @@ class ModelFit:
     aic: float | None = None
     name: str = ""
     visible: bool = True
+    # traçabilité : date du dernier fit et version du logiciel qui l'a calculé
+    date: str = ""
+    version: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     @property
@@ -97,9 +104,9 @@ class Capture:
     instrument: str = ""            # réponse de l'appareil au test de liaison
     models: list = field(default_factory=list)      # ModelFit
     color: str = "#0B6BCB"
+    # tracée sur les graphes : état de la session, remis à False à la lecture d'un fichier
     visible: bool = True
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    path: str | None = None         # fichier de la librairie (non enregistré dans le json)
 
     def __post_init__(self):
         f = np.asarray(self.f, dtype=float)

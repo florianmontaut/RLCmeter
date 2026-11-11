@@ -27,10 +27,13 @@ Différences avec la macro VBA :
 """
 from __future__ import annotations
 
+import datetime
 from dataclasses import dataclass
 
 import numpy as np
 from scipy.optimize import least_squares
+
+from version import VERSION
 
 FOSTER, CAUER, CAPACITOR = "Foster", "Cauer", "Condensateur"
 INDUCTOR_KINDS = (FOSTER, CAUER)
@@ -333,4 +336,6 @@ def run(model, f, z) -> FitResult:
     model.nr, model.nc = result.nr, result.nc
     model.params = [float(v) for v in result.params]
     model.rel_err, model.aic = result.rel_err, result.aic
+    model.date = datetime.datetime.now().isoformat(timespec="seconds")
+    model.version = VERSION
     return result

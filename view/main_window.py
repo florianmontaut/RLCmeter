@@ -37,7 +37,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("RLCmeter — HP 4194A")
         self.setWindowIcon(QtGui.QIcon(str(ICON)))
-        self.resize(1400, 820)
+        self.resize(1640, 880)
         self._init_actions()
         self._init_menus()
         self._init_toolbar()
@@ -78,11 +78,24 @@ class MainWindow(QtWidgets.QMainWindow):
                                    "Combiner des composants en filtre et estimer sa réponse")
         self.actionTutorial = action("Tutoriel", "file", "Tutoriel", "F1")
         self.actionAbout = QtGui.QAction("À propos", self)
+        # librairie
+        self.actionAddToLibrary = action(
+            "Ajouter à la librairie", "import",
+            "Ranger la mesure sélectionnée dans la librairie, avec sa fiche", "Ctrl+L")
+        self.actionEditComponent = action("Modifier la fiche...", "file",
+                                          "Modifier la fiche du composant sélectionné")
+        self.actionShowDrafts = QtGui.QAction("Brouillons des sessions précédentes", self)
+        self.actionShowDrafts.setCheckable(True)
+        self.actionShowDrafts.setToolTip(
+            "Afficher aussi les mesures des sessions précédentes non ajoutées à la librairie")
 
     def _init_menus(self):
         bar = self.menuBar()
         self.menuFile = bar.addMenu("Fichier")
         self.menuFile.addActions([self.actionOpen, self.actionSaveAs])
+        self.menuFile.addSeparator()
+        self.menuFile.addActions([self.actionAddToLibrary, self.actionEditComponent,
+                                  self.actionShowDrafts])
         self.menuFile.addSeparator()
         self.menuFile.addActions([self.actionExportSubckt, self.actionExportCsv])
         self.menuFile.addSeparator()
@@ -101,7 +114,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, self.toolbar)
         self.toolbar.addActions([self.actionTestLink, self.actionMeasure])
         self.toolbar.addSeparator()
-        self.toolbar.addActions([self.actionFit, self.actionExportSubckt, self.actionExportCsv])
+        self.toolbar.addActions([self.actionFit, self.actionAddToLibrary])
+        self.toolbar.addSeparator()
+        self.toolbar.addActions([self.actionExportSubckt, self.actionExportCsv])
         self.toolbar.addSeparator()
         self.toolbar.addAction(self.actionDelete)
         self.toolbar.addSeparator()
@@ -116,12 +131,57 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ------------------------------------------------------------------ zone centrale
     def _init_central(self):
-        # arborescence : captures, et sous chacune ses modèles
+        edit = (QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+                | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
+
+        # session : mesures faites depuis l'ouverture (brouillons), et leurs modèles
         self.tree = QtWidgets.QTreeView()
         self.tree.setHeaderHidden(True)
-        self.tree.setMinimumWidth(240)
-        self.tree.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
-                                  | QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
+        self.tree.setEditTriggers(edit)
+
+        # librairie : composants caractérisés, triables et filtrables ; mesures et
+        # modèles en lignes enfants
+        self.searchEdit = QtWidgets.QLineEdit()
+        self.searchEdit.setPlaceholderText("Rechercher (nom, fabricant, code Fay, valeur...)")
+        self.searchEdit.setClearButtonEnabled(True)
+        self.kindFilter = QtWidgets.QComboBox()
+        self.technologyFilter = QtWidgets.QComboBox()
+        self.manufacturerFilter = QtWidgets.QComboBox()
+        filters = QtWidgets.QHBoxLayout()
+        filters.setContentsMargins(0, 0, 0, 0)
+        for combo in (self.kindFilter, self.technologyFilter, self.manufacturerFilter):
+            combo.setSizeAdjustPolicy(
+                QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            filters.addWidget(combo, 1)
+        self.libraryTree = QtWidgets.QTreeView()
+        self.libraryTree.setSortingEnabled(True)
+        self.libraryTree.setAlternatingRowColors(True)
+        self.libraryTree.setEditTriggers(edit)
+        self.libraryTree.setUniformRowHeights(True)
+        self.libraryCount = QtWidgets.QLabel()
+
+        def panel(title, *content):
+            box = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(box)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(4)
+            label = QtWidgets.QLabel(f"<b>{title}</b>")
+            layout.addWidget(label)
+            for item in content:
+                if isinstance(item, QtWidgets.QLayout):
+                    layout.addLayout(item)
+                else:
+                    layout.addWidget(item)
+            return box
+
+        self.leftSplitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.leftSplitter.addWidget(panel("Session", self.tree))
+        self.leftSplitter.addWidget(panel("Librairie", self.searchEdit, filters,
+                                          self.libraryTree, self.libraryCount))
+        self.leftSplitter.setStretchFactor(0, 1)
+        self.leftSplitter.setStretchFactor(1, 2)
+        self.leftSplitter.setMinimumWidth(380)
 
         # graphes : même axe des fréquences (log), une grandeur chacun
         self.graph = pg.GraphicsLayoutWidget()
@@ -147,12 +207,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.paramSplitter.setSizes([330, 430])
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        self.splitter.addWidget(self.tree)
+        self.splitter.addWidget(self.leftSplitter)
         self.splitter.addWidget(self.graph)
         self.splitter.addWidget(self.paramSplitter)
-        self.splitter.setStretchFactor(0, 1)
+        self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 5)
         self.splitter.setStretchFactor(2, 2)
+        self.splitter.setSizes([600, 680, 340])
         self.splitter.setCollapsible(1, False)
         self.setCentralWidget(self.splitter)
 
